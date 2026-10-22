@@ -1,0 +1,193 @@
+================================================================
+v41 — 깊은 Residual CNN backbone + v40 파이프라인: 70.10%
+       아키텍처 업그레이드 실패 — backbone 용량은 병목이 아니었다
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+프로젝트에서 성능을 가장 크게 움직인 건 언제나 아키텍처였다(v30, +4.69p).
+v40에서 "증강은 backbone과 강하게 시너지"(v36→v40 base +0.80p)임을 확인했으니,
+backbone 자체를 강화하면 그 시너지가 더 커지리라 기대했다.
+
+과거 아키텍처 시도(v23 Transformer 67.7%, v24 multi-scale 64.4%)는 전부
+증강 없이 해서 실패했다. 이번엔 v40의 강한 증강 파이프라인과 함께 재도전.
+
+가설: 더 강한 backbone + v40 파이프라인 → +0.5~1.5p, 70%대 중반.
+
+
+[2] 전 버전(v40)과 달라진 점
+
+유일한 변경: 아키텍처(backbone).
+  v40: models_v8.SubjectAwareCNNLSTMAttention
+       (2-conv, 128채널, 시퀀스 150, 파라미터 805,266)
+  v41: models_v41.SubjectAwareResCNNLSTMAttention
+       (stem + ResBlock×5, 256채널, 시퀀스 75, 파라미터 1,472,658 ≈ 1.8배)
+
+  backbone 구조: Conv k5+Pool → ResBlock(64)×2 → Pool → ResBlock(64→128)+
+                 ResBlock(128) → Pool → ResBlock(128→256)
+  헤드(subject emb→LSTM→Attention→fc)와 forward는 v8과 100% 동일.
+  backbone 모듈 이름 'cnn' 유지 → freeze_cnn 그대로 작동.
+
+증강·손실·스케줄·fine-tuning은 v40과 100% 동일:
+  강한 증강(magwarp0.30/timewarp0.25/mixup0.30/jitter0.06), focal γ2,
+  50ep, T_max=50, batch=256 → adaptive fine-tuning(freeze_cnn, 15ep).
+
+
+[3] 변경 이유 + 기대했던 효과
+
+깊은 residual backbone의 논리:
+  v8 backbone은 conv 2층으로 얕다. 더 깊은 residual 구조는 더 추상적이고
+  풍부한 특징을 추출할 수 있고, residual skip이 학습 안정성을 확보해
+  v24 multi-scale이 겪은 "학습이 어려워지는" 문제를 막는다.
+  증강이 backbone을 잘 훈련시키므로(v40) 더 큰 backbone일수록 이득이 클 것.
+
+기대: pooled base +0.5p 이상 → 최종 71%+.
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: base +0.5p 이상 → 최종 71%+
+실제: **base −0.08p, 최종 −0.25p** — v40을 못 넘음. 아키텍처 업그레이드 실패.
+
+  [1단계 pooled base]
+    v41b: 69.97%  (v40b 70.05% 대비 −0.08p)  = 사실상 동률(run variance)
+    hard 59.98%(v40b 59.54% 대비 +0.44p), gap 11.41p(v40b 12.00p 대비 축소)
+    macro-F1 0.5940 (v40b 0.5974 대비 −0.0034)
+    best epoch = 50 (미수렴, v40b와 동일 패턴)
+
+  [2단계 최종 adaptive]
+    v41: 70.10%  (v40 70.35% 대비 −0.25p)
+    fine-tuning 이득: +0.14p (v40의 +0.31p보다 작음)
+    선택: FT 36명 / BASE 4명 (v40과 동일 분포)
+    hard 59.44%(v40 59.36%과 비슷), easy 71.62%(v40 71.92%보다 낮음)
+
+**핵심: 파라미터를 1.8배 늘렸는데 이득이 없었다.**
+  v41 base = v40 base (동률), 최종은 오히려 소폭 낮음.
+  → CNN backbone의 용량(depth/width)은 현재 성능의 병목이 아니다.
+    v8의 얕은 2-conv backbone이 이미 이 입력(24ch/600샘플)에서
+    변별력 있는 특징을 충분히 뽑고 있었다는 뜻.
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음. residual+증강 덕에 v23/v24 같은 폭락은 없었다
+  (v41 base가 v40과 대등하게 안정적으로 수렴). 스모크 테스트에서
+  파라미터·shape·freeze_cnn 호환 사전 확인 완료.
+
+시간: pooled 118.7분(v40 107.3분보다 +11분, 큰 모델), fine-tuning 25.9분.
+
+hard subject fine-tuning 불안정 재확인 (v40과 동일 패턴):
+  5명 모두 FT 선택됐으나 test에서 대부분 악화:
+    s04 0.6094→0.5979, s07 0.6384→0.6317, s26 0.6298→0.6222,
+    s28 0.5575→0.5560, s31 0.5642→0.5642
+  → pooled hard 59.98% → 최종 59.44%로 다시 하락. hard는 여전히
+    fine-tuning이 역효과(val≠test). backbone을 바꿔도 이 문제는 그대로.
+
+best_epoch=50 관찰:
+  더 큰 모델이라 50ep로 용량을 다 못 썼을 가능성은 있다. 그러나 v40도
+  best_epoch=50(동일 조건)이므로 공정 비교에선 아키텍처 이점이 없음.
+  100ep로 늘리면 base는 오를 수 있으나 v39 교훈상 fine-tuning 궁합이
+  나빠질 위험 → 파이프라인 전체로는 권장 안 됨.
+
+
+[6] 이번 버전에서 배운 점
+
+**backbone 용량은 ~70% 지점에서 병목이 아니다. "더 크게"는 답이 아니었다.**
+
+  파라미터 805K → 1.47M (1.8배), 이득 0. v23/v24(폭락)와 달리 이번엔
+  안정적으로 학습됐는데도 v40과 동률에 그쳤다.
+  → 얕은 v8 backbone이 이미 이 신호에서 뽑을 수 있는 특징을 다 뽑고 있다.
+
+**"아키텍처가 중요하다"와 "더 큰 아키텍처가 좋다"는 다른 얘기다.**
+  v30의 +4.69p는 '올바른 귀납 편향'(MaxPool, subject emb→LSTM 입력,
+  ELU, 비선형 attention) 덕이었지, 순수 용량 때문이 아니었다.
+  v41은 그 올바른 편향을 유지한 채 depth/width만 늘렸고 → 이득 없음.
+  즉 v8은 이미 "올바른 구조"였고, 남은 개선은 구조를 키우는 데 있지 않다.
+
+**막다른 길 하나 더 확정:**
+  장기학습(v39)에 이어 "backbone 확대"(v41)도 최종 파이프라인에서 손해.
+  base를 올리는 유효 레버는 여전히 "강한 증강"(v40, +0.80p)뿐.
+
+**진짜 병목은 데이터/신호 품질(특히 hard subject)에 있다.**
+  아키텍처를 키워도 hard는 안 풀리고(fine-tuning 여전히 역효과),
+  gap도 근본적으로 안 좁혀진다. 다음 레버는 모델이 아니라 데이터 쪽.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+v41이 "backbone 확대는 무효"임을 확정. 챔피언은 v40(70.35%) 유지.
+남은 개선은 (a) 증강 강화, (b) hard subject 처리, (c) 입력 표현 변경 —
+'용량'이 아닌 방향으로.
+
+1. **(v42, 우선) hard subject는 fine-tuning 제외 (강제 BASE)**
+   v40·v41 모두 hard 5명에서 fine-tuning이 역효과(val≠test).
+   adaptive 대신 hard는 무조건 pooled base 사용하도록 규칙화.
+   기대: hard를 pooled 수준(~60%)으로 확보 → 전체 +0.05~0.15p + 안정성.
+   비용 거의 0(로직만). 가장 확실한 즉시 이득.
+
+2. **(v43, 단기) 증강 강도 추가 탐색**
+   v40에서 강도↑가 +0.80p. 최적점을 아직 안 지났을 수 있음.
+   magwarp/timewarp/mixup 한 단계 더, 또는 전극 shift 증강 추가.
+   증강은 검증된 유효 레버 → 성공 확률 높음. 기대: +0.1~0.3p.
+
+3. **(중기) 입력 표현 변경 — 용량이 아닌 정보의 문제로 접근**
+   backbone 확대가 무효였으므로, 모델에 주는 '정보'를 바꾼다:
+   - 시간-주파수(STFT/CWT 스펙트로그램) 또는 수공 특징(RMS/MAV/WL/ZC 등)
+   - Ninapro DB2에서 검증된 강한 특징 세트
+   기대: 불확실하나 +0.5p 이상 잠재력. backbone 대신 입력을 바꾸는 실험.
+
+4. **(참고) backbone 확대 경로는 종료.**
+   v41이 무효 확인. 더 깊이/넓게는 시간·메모리만 늘고 이득 없음.
+   장기학습(v39)과 함께 "막다른 길" 목록에 추가.
+
+
+[8] 재현 정보
+
+  # 도커 컨테이너 안에서 순차 실행
+  /usr/local/bin/python code/train_cnn_v41.py    # pooled base (~119분)
+  /usr/local/bin/python code/finetune_v41.py     # adaptive fine-tuning (~26분)
+
+  아키텍처: code/models_v41.py (SubjectAwareResCNNLSTMAttention, 1.47M params)
+  데이터  : 전처리전달_v28
+  증강 강도: v40과 동일 (magwarp0.30/timewarp0.25/mixup0.30)
+  결과: results/v41/result_v41_pooled.json (base 69.97%),
+        results/v41/result_v41.json (최종 70.10%)
+  주의: 증강·fine-tuning 확률적 → ±0.1~0.2p 분산 (v40과의 −0.25p 차이는
+        일부 variance, 일부 실질 — 반복해도 v40을 유의하게 넘길 근거 없음).
+
+
+[9] 비용 원장
+
+  1단계 pooled : 118.7분 (v40 107.3분 대비 +11분, 1.8배 모델)
+  2단계 finetune: 25.9분
+  합계         : 약 2.4시간
+  결과물        : results/v41/ (best_model_v41.pth ~5.9MB + json 2개)
+  GPU 메모리    : 스모크 테스트 peak 1.57GB(batch256) — 여유 (8GB)
+
+  비용 관련 특이사항:
+    2.4시간 + 1.8배 파라미터를 투자했으나 v40 대비 −0.25p. 순손실.
+    "backbone 확대"의 시간·메모리 비용 대비 효과가 없음을 확인.
+
+
+[전체 버전 비교표 (누적, 증강 라인)]
+
+  버전  방식                                       acc       hard    gap
+  ────  ─────────────────────────────────────────  ──────    ──────  ──────
+  v36   v8 arch + 증강(표준) 50ep                  69.25%    58.71%
+  v38   v8 arch + 장기학습 100ep                   69.48%    59.66%
+  v40b  v8 arch + 강한 증강 50ep (pooled)          70.05%    59.54%  12.00p
+  v41b  Residual CNN + 강한 증강 50ep (pooled)     69.97%    59.98%  11.41p
+  v37   v36 + adaptive                             69.83%    58.87%
+  v39   v38 + adaptive                             69.65%    59.50%
+  v41   v41b + adaptive                            70.10%    59.44%
+  v40   v40b + adaptive                            70.35%    59.36%  ← 챔피언 유지
+
+  ★ 챔피언: v40 (70.35%). v41은 −0.25p로 아키텍처 업그레이드 실패.
+
+  유효 레버 재확인:
+    강한 증강      : +0.80p  (backbone 개선, fine-tuning과 상보) ← 유일한 base 레버
+    backbone 확대  :  0.00p  (v41, 무효)          ← 막다른 길
+    장기학습       : fine-tuning과 대체            ← 막다른 길
+
+  다음: v42 (hard subject FT 제외) — 모델이 아닌 데이터/전략 쪽으로 전환.

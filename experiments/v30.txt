@@ -1,0 +1,152 @@
+================================================================
+v30 — 팀 10Hz 데이터 + v8 실제 아키텍처: 68.25%
+       갭 원인 확정 — 아키텍처가 전부였다
+================================================================
+
+[이 버전을 시작한 계기]
+
+v29에서 v8 전처리를 정확히 복제했더니 데이터 통계는 v8과 거의 동일한데
+결과는 63.57% (v8 pooled 68.68% 대비 -5.11p).
+
+train_cnn_v8.py vs train_cnn_v29.py 비교로 아키텍처가 완전히 다름을 확인:
+  v8  : models_v8.SubjectAwareCNNLSTMAttention (k=5, ELU, MaxPool×2, subj→LSTM입력)
+  v25-: 인라인 SubjectAwareCNNLSTM (k=3, ReLU, MaxPool없음, subj→LSTM출력)
+
+가설: 아키텍처 차이가 ~5p 갭의 원인 → v8 아키텍처를 팀 데이터에 적용하면 회복.
+
+
+[방법: code/train_cnn_v30.py]
+
+아키텍처: models_v8.SubjectAwareCNNLSTMAttention (v8 실제)
+  Conv1d(24→64, k=5, padding=2) + BN + ELU + MaxPool1d(2)  ← 600→300
+  Conv1d(64→128, k=3, padding=1) + BN + ELU + MaxPool1d(2)  ← 300→150
+  LSTM(128+32→128, 2L, bidir) ← Subject embedding이 매 타임스텝 LSTM 입력에 연결
+  Attention(tanh+Linear+softmax, 비선형)
+  Dropout(0.4) + Linear(256→50)
+  SubjectEmbedding(41, 32)  ← n_subjects+1
+
+데이터: 전처리전달_10hz/ (build_dataset_new.py, 팀 코드 기반 ENV 10Hz/4차)
+파라미터 수: 805,266 (v25-v29의 705,203보다 약 14% 더 큼)
+하이퍼파라미터: AdamW 1e-3, weight_decay=1e-4, CosineAnnealingLR(T_max=50, eta_min=1e-6)
+               50ep, patience=8, batch=256 (512 OOM)
+
+s_train 1-indexed 그대로 사용 (v8 방식, Embedding size=41).
+
+
+[재현 정보]
+
+  python code/train_cnn_v30.py
+  # 모델: results/v30/best_model_v30.pth
+  # 결과: results/v30/result_v30.json
+
+
+[비용 원장: 시간/디스크/GPU]
+
+  학습 시간: 110.9분 (1.85시간). v25-v29 대비 1/3 수준.
+             MaxPool×2로 LSTM 입력 600→150 단축 → 대폭 빠름.
+  결과물: results/v30/
+
+
+[결과]
+
+  학습 곡선: 빠른 수렴. ep11에서 이미 val_acc=70.19%, ep25까지 꾸준히 상승.
+             tr_acc=0.8949 (v25-v29의 0.76보다 훨씬 높음 → 표현력 차이).
+             50ep 완주 (early stop 미발동).
+
+  테스트 결과:
+
+                    v8(pooled)  v10(fine-tuned)  v27(단순arch)  v30(v8arch)
+  전체 acc          68.68%      69.10%           63.56%         68.25%
+  Hard acc          ~58%        ~58%             51.80%         57.04%
+  Easy acc          ~71%        ~71%             65.24%         69.85%
+  Gap (easy-hard)   ~13p        ~13p             13.43p         12.81p
+  Macro-F1          —           —                48.01%         56.88%
+
+  v8 pooled 대비: -0.43p  (사실상 동일한 수준)
+  v27 대비:       +4.69p  (아키텍처 변경만으로)
+  학습 시간:      1/3 단축
+
+
+[기대와 실제가 어떻게 달랐는가]
+
+기대: v8 아키텍처가 팀 데이터에서도 좋은 성능을 보일 것.
+     그러나 전처리 차이(10Hz vs v8)로 인해 v8 pooled보다는 낮을 것.
+
+실제: 68.25% — v8 pooled(68.68%)와 0.43p 차이. 사실상 동등한 성능.
+     → 팀 전처리(10Hz/4차)는 충분히 좋다.
+     → 5.5p 갭의 원인은 전처리가 아닌 아키텍처였다.
+
+
+[전체 갭 재분석 — 최종 결론]
+
+  v25(팀 5Hz, 단순arch): 62.58%  기준
+  v27(팀 10Hz, 단순arch): 63.56%  → 필터 변경: +0.98p
+  v28(팀 10Hz, norm→env, 단순arch): 64.69%  → 정규화 순서: +1.13p
+  v30(팀 10Hz, v8 arch): 68.25%  → 아키텍처 변경: +4.69p (v27 대비)
+
+  아키텍처가 전체 갭(6.52p)의 72%를 설명.
+  전처리 개선(필터+정규화)이 나머지 ~2p 기여.
+
+  v8 pooled(68.68%) vs v30(68.25%): 0.43p
+  → 팀 전처리(10Hz)와 우리 전처리(v8) 간 실질 성능 차이는 0.43p에 불과.
+
+
+[아키텍처 차이 분석]
+
+핵심 요소별 기여 추정 (v8 arch의 무엇이 중요한가):
+
+  1. MaxPool×2: 시퀀스 600→150 압축
+     - LSTM이 더 높은 추상도의 특징을 처리
+     - 학습 속도 3배 단축 (부산물)
+
+  2. Subject embedding → LSTM 입력 연결 (매 타임스텝)
+     - LSTM이 피험자 정체성을 조건으로 시간 모델링
+     - 피험자 간 신호 스타일 차이를 더 효과적으로 처리
+
+  3. k=5 (첫 번째 Conv)
+     - 더 넓은 수용 야(receptive field): 5샘플=2.5ms
+     - EMG 특징을 더 넓은 시간 맥락에서 추출
+
+  4. ELU vs ReLU
+     - ELU: 음수 입력에서 포화되지 않고 연속적 기울기
+     - dying ReLU 문제 없음
+
+  5. 비선형 Attention (tanh+linear)
+     - 더 풍부한 가중치 분포 학습 가능
+
+
+[전략적 결정]
+
+v30이 68.25%로 v8 pooled에 사실상 도달했으므로:
+
+  1. 팀 전처리 권고 확정:
+     ENV 10Hz/4차 (이미 합의됨)
+     → 전처리보다 아키텍처가 훨씬 중요하다는 근거 확보
+
+  2. 다음 목표: 69% 돌파 (v10 fine-tuned 수준 또는 그 이상)
+     - v31: v30 모델 기반 per-subject fine-tuning (v10 방식)
+             기대: 69~70%
+
+  3. 아키텍처 추가 개선 (v32+):
+     - Hard subject oversampling (2~3×)
+     - 더 긴 학습 (100ep)
+     - 전처리 v28 방식(norm→env, +1.13p) + v8 arch 조합
+
+
+[향후 개선 후보]
+
+1. (즉시, v31) v30 체크포인트 기반 per-subject fine-tuning.
+   v10에서 68.68% → 69.10%로 +0.42p 달성했던 방식.
+   v30(68.25%)에 적용 시 69~70% 기대.
+
+2. (단기) 전처리 v28 + v8 arch 조합 (v32).
+   v28이 단순arch에서 +1.13p → v8 arch에서도 유사한 개선 기대.
+   기대: 68.25% + ~1p = 69~69.5%.
+
+3. (단기) Hard subject oversampling + focal loss.
+   v30의 hard acc=57.04%. 타겟 60% 이상.
+   hard {28,31,4,26,7} 피험자 2~3× 오버샘플링.
+
+4. (중기) 더 긴 학습.
+   v30 tr_acc=0.8949, 50ep에서 수렴 보임. 하지만 val_f1이 ep25 이후 정체 → 현재 아키텍처로 ceiling.
+   LR warm-up + longer schedule로 탐색.

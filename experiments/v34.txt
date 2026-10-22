@@ -1,0 +1,177 @@
+================================================================
+v34 — v28 전처리 + v8 arch + hard subject ×2 oversampling: 68.61%
+       전략 실패 — overall -0.09p, hard acc +0.16p에 불과
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v31, v33에서 s04와 s07이 fine-tuning 시 일관되게 악화됐다.
+이 두 피험자는 fine-tuning으로는 해결되지 않으므로
+pooled 학습 단계에서 해결하겠다는 판단.
+
+전략: hard subjects {4,7,26,28,31}의 train 윈도우를 2배 복제.
+      모델이 학습 중 hard subjects 패턴을 더 자주 보면서 더 잘 학습할 것.
+
+선택지:
+  (A) hard oversampling ×2  → v34, 즉시
+  (B) focal loss (γ=2)     → 어려운 샘플 집중, 추후
+  (C) adaptive fine-tuning → 피험자별 LR 차등, 추후
+
+
+[2] 전 버전(v32)과 달라진 점
+
+v32 대비 유일한 변경:
+  train set: hard subjects 윈도우 ×2 복제
+    원본 447,047개 → 502,600개 (+55,553개 = hard 윈도우 수)
+  val, test: 변경 없음 (공정한 평가 유지)
+
+나머지 완전 동일: v28 전처리, v8 arch, AdamW 1e-3, CosineAnnealingLR(T_max=50), batch=256
+
+
+[3] 변경 이유 + 기대했던 효과
+
+근거: 클래스 불균형 문제에서 소수 클래스 오버샘플링은 효과적인 표준 기법.
+      Hard subjects = 분류하기 어려운 소수 그룹 → 더 많이 노출시켜 학습.
+
+기대:
+  hard acc: 57.84%(v32) → 60%+ (약 +2p 이상)
+  overall : 68.70%(v32) → 69.0~69.2% (+0.3~0.5p)
+  easy acc: 소폭 감소 감수 (hard 개선으로 overall은 상승 예상)
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: hard acc +2p, overall +0.3~0.5p
+실제:
+  overall : 68.61%  (v32 68.70% 대비 **-0.09p**)
+  hard acc: 58.00%  (v32 57.84% 대비 **+0.16p** — 기대의 1/12)
+  easy acc: 70.12%  (v32 70.25% 대비 **-0.13p**)
+  gap     : 12.13p  (v32 12.40p 대비 소폭 감소 — 그러나 easy 하락 때문)
+
+전략적 실패. 오버샘플링이 hard acc를 유의미하게 개선하지 못했고
+오히려 overall과 easy acc가 소폭 하락.
+
+비교표:
+  v33  68.89%  v28 전처리 + v8 arch + fine-tuning  ← 현재 최고
+  v32  68.70%  v28 전처리 + v8 arch (baseline)
+  v34  68.61%  v28 전처리 + v8 arch + hard ×2      ← 오버샘플링 실패
+
+학습 곡선 비교:
+  v32: val_hard ep6=0.5913, ep32=0.6186, early stop ep40
+  v34: val_hard ep6=0.6110, ep13=0.6316, ep28=0.6261, early stop ep46
+  → 초반(ep6~13)에는 val_hard가 v32보다 높지만
+    이후 수렴 시 test_hard 차이가 미미 (58.00% vs 57.84% = +0.16p)
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음.
+소요 시간: 110.1분 (v32의 88.2분보다 더 걸림 — train set 12% 증가 + ep46 완주).
+
+주목할 관찰:
+  val_f1 기준 best checkpoint: ep38(0.6111) → test 시 68.61%.
+  ep13에서 val_hard=0.6316으로 최고점을 찍은 뒤 하락.
+  val_f1(macro)로 checkpoint 선택하면 hard-specific 개선이 반영되지 않을 수 있음.
+  → val_hard를 기준으로 checkpoint를 선택하면 결과가 달라질 수 있지만
+     overall acc가 낮아질 위험도 있음.
+
+
+[6] 이번 버전에서 배운 점
+
+**Hard subjects의 문제는 데이터 수가 아닌 신호 품질이다.**
+
+오버샘플링은 데이터가 부족한(수가 적은) 경우에 효과적이다.
+그러나 hard subjects의 문제는 "학습 데이터가 적어서"가 아니라
+"EMG 신호 자체가 노이즈가 많고 피험자마다 패턴이 불규칙해서"다.
+
+같은 노이즈 데이터를 2배 더 보여줘도 모델은 그 노이즈 패턴을
+더 잘 학습할 뿐, 일반화 능력이 향상되지 않는다.
+오히려 hard 데이터에 과노출되어 easy subjects 학습이 희석됨.
+
+**대조:**
+  - v33 fine-tuning: 피험자별로 소량 데이터로 개인화 → hard +0.44p
+  - v34 oversampling: 같은 hard 데이터 2배 → hard +0.16p
+  fine-tuning이 oversampling보다 hard subjects 개선에 3배 효과적.
+
+**일반화된 원칙:**
+"신호 품질 문제(노이즈)는 데이터 증강(오버샘플링)으로 해결 불가.
+ 피험자별 개인화(fine-tuning) 또는 신호 전처리 개선이 올바른 접근."
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+1. **(v35, 즉시) v34 체크포인트 기반 fine-tuning**
+   v34가 v32보다 overall은 낮지만 hard acc는 약간 높음(58.00% vs 57.84%).
+   v33처럼 per-subject fine-tuning 적용 시 hard subjects에서 추가 이득 가능.
+   기대: 68.61% + ~0.21p = 68.8% 내외.
+   그러나 v33(68.89%)을 넘기는 어렵고, 시간 대비 가성비가 낮을 수 있음.
+
+   → 사실상 v33(68.89%)이 현재 최적 전략임을 재확인하는 실험이 될 것.
+      이 방향보다 다른 접근 탐색이 더 효율적.
+
+2. **(중기) 전처리 완성형: v28 방식 + 24ch 공동 정규화**
+   v32/v34의 X_train mean=0.24(non-zero) 문제.
+   normalize12ch → env → stack24ch → normalize24ch(jointly).
+   이렇게 하면 mean≈0이 되어 학습 안정성 향상.
+   기대: v32 대비 +0.1~0.2p → fine-tuning까지 합산 시 v33 초과 가능.
+
+3. **(중기) focal loss (γ=2)**
+   오버샘플링 대신 손실 함수로 어려운 샘플에 집중.
+   hard subjects의 어려운 제스처는 cross-entropy loss에서 낮은 확률 → focal이 집중.
+   단, label_smoothing과의 조합 주의.
+   기대: hard acc +0.5~1p, overall 유지 또는 소폭 상승.
+
+4. **(중기) v33 위에 adaptive fine-tuning**
+   현재 v33에서 과적합이 발생하는 피험자(s21, s23, s08)는 fine-tuned 대신 base 사용.
+   val_f1 기준 ft > base인 경우만 fine-tuned 모델 채택.
+   기대: v33(68.89%) 대비 +0.1~0.2p 추가.
+
+5. **(장기) 아키텍처 개선**
+   현재 v8 arch에서 반복적으로 ceiling이 보임 (pooled ~68.7%, fine-tuned ~68.9%).
+   더 깊은 CNN, Transformer 기반 시간 모델링, multi-scale 특징 추출 등 탐색.
+
+
+[8] 재현 정보
+
+  python code/train_cnn_v34.py
+
+  DATA_DIR     = /mnt/data/medical_project/ninapro_db2_project/전처리전달_v28
+  OUT_DIR      = /mnt/data/medical_project/ninapro_db2_project/results/v34
+  OVERSAMPLE   = 2
+  HARD_SUBJECTS = {4, 7, 26, 28, 31}
+
+  결과: results/v34/result_v34.json
+
+
+[9] 비용 원장
+
+  학습 시간 : 110.1분 (v32의 88.2분보다 25% 더 소요 — train set 12% 증가 + ep46)
+  데이터     : 전처리전달_v28/ + 메모리 내 복제 (디스크 추가 없음)
+  결과물     : results/v34/
+  GPU 메모리 : 측정하지 않음
+
+  비용 관련 특이사항:
+    시간이 v32보다 22분 더 걸렸으나 성능은 오히려 낮음.
+    오버샘플링으로 인한 추가 비용 대비 효과 없음.
+
+
+[전체 버전 비교표 (누적)]
+
+  버전  데이터              아키텍처  방식                acc       hard acc
+  ────  ──────────────────  ────────  ──────────────────  ──────    ──────────
+  v25   팀 5Hz              단순      pooled              62.58%        —
+  v27   팀 10Hz             단순      pooled              63.56%    51.80%
+  v28   팀 10Hz (norm→env)  단순      pooled              64.69%        —
+  v29   v8 전처리           단순      pooled              63.57%    51.97%
+  v8    v8 전처리           v8 arch   pooled              68.68%      ~58%
+  v30   팀 10Hz             v8 arch   pooled              68.25%    57.04%
+  v31   팀 10Hz             v8 arch   fine-tuned          68.38%    56.73%
+  v32   v28 전처리          v8 arch   pooled              68.70%    57.84%
+  v34   v28 전처리          v8 arch   pooled+hardOS×2     68.61%    58.00%
+  v33   v28 전처리          v8 arch   fine-tuned          68.89%    58.28%  ← 최고
+  v10   v8 전처리           v8 arch   fine-tuned          69.10%      ~58%
+
+  현재 최고: v33 (68.89%), v10까지 -0.21p
+  oversampling 전략: 실패 확인 (v34 < v32 < v33)
+  hard acc 추이: 51.80%(v27)→57.04%(v30)→57.84%(v32)→58.28%(v33)

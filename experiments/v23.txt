@@ -1,0 +1,117 @@
+================================================================
+v23 — Multi-scale Conv + Transformer: 전체 성능 하락, gap만 축소
+================================================================
+
+[이 버전을 시작한 계기]
+
+v21/v22에서 개별 모델 ≈ pooled 모델임을 확인. 에포크 증가도 무의미.
+MiniMax-M3 LLM 외부 평가 결과, 현재 아키텍처의 핵심 병목으로
+"k=3 단일 스케일(1.5ms만 봄)" + "600 timestep LSTM 비효율"을 지목.
+
+LLM 추천 아키텍처: multi-scale dilated conv(k=3/15/51, d=1/2/4) +
+MaxPool(stride=4, 600→150) + Transformer encoder(2L, 128d, 4head) + subject emb.
+"단일 실험 최우선 후보, 기대 효과 +2~4%" 로 제안받아 실행.
+
+
+[방법: code/train_cnn_v23.py, code/models_v23.py]
+
+아키텍처:
+  Multi-scale Conv:
+    branch1: Conv1d(24, 64, k=3,  dilation=1)  → 1.5ms RF
+    branch2: Conv1d(24, 64, k=15, dilation=2)  → 14.5ms RF
+    branch3: Conv1d(24, 64, k=51, dilation=4)  → 100.5ms RF
+    concat(192ch) → Conv1d(192, 128, k=1) + BN + ReLU  # (B, 128, 600)
+  MaxPool1d(kernel=4, stride=4)                         # (B, 128, 150)
+  PositionalEncoding + TransformerEncoder(2L, d=128, 4head)
+  Attention weighted sum                                 # (B, 128)
+  SubjectEmbedding(40, 32) concat                       # (B, 160)
+  Dropout(0.4) + Linear(160, 50)
+
+파라미터 수: 537,523 (v8 추정 ~700k보다 적음)
+학습: AdamW(1e-3, 1e-4), CosineAnnealingLR, 50ep, patience=8, batch=256
+
+
+[재현 정보]
+
+  python /mnt/data/medical_project/ninapro_db2_project/code/train_cnn_v23.py
+  # 모델: results/v23/best_model_v23.pth
+  # 결과: results/v23/result_v23.json
+
+
+[비용 원장: 시간/디스크/GPU]
+
+  학습 시간: 146.4분(2.4시간). v10(pooled BiLSTM ~4~6h) 대비 절반.
+             Transformer 병렬 처리 덕분.
+  결과물: results/v23/
+
+
+[결과]
+
+  epoch별 주요 지표 (val 기준):
+    ep22: val_f1 0.5770  hard 0.5981  easy 0.7026  ← 첫 70% 돌파
+    ep49: val_f1 0.6001  hard 0.6136  easy 0.7077  ← best
+    50ep 완주 (patience 소진 없음)
+
+  테스트 결과:
+
+                     v8(pooled)   v10(pooled)   v23(Multi-scale+Transformer)
+  전체 acc           68.69%        69.10%         67.73%   (-1.37p vs v10)
+  Hard acc           57.52%        ~58%           58.21%   (+0.69p vs v8)
+  Easy acc           70.29%        ~71%           69.09%   (-1.20p vs v8)
+  Gap (easy-hard)    12.77p        ~13p           10.88p   (역대 최소)
+  Macro-F1           56.92%        —              56.30%
+
+
+[기대와 실제가 어떻게 달랐는가]
+
+기대: LLM 예측 "+2~4% overall, +4~8% on hard". v10(69.10%)을 넘어 71~73% 기대.
+
+실제: 전체 -1.37p 하락(69.10% → 67.73%). Easy 피험자는 -1.20p 손해.
+Hard 피험자는 +0.69p 소폭 개선. Gap이 10.88p로 역대 최소가 됐지만,
+이는 easy가 낮아진 덕분이지 hard가 크게 올라간 덕분이 아님.
+
+tr_acc 84.89% vs test_acc 67.73% — train-test 괴리가 v8/v10보다 확연히 크다.
+
+
+[원인 분석]
+
+실패 원인을 두 가지로 분리:
+
+1. MaxPool(stride=4)가 지나치게 공격적:
+   600→150으로 4배 다운샘플. BiLSTM(v8)이 잡아내던 시계열 내 세밀한
+   시간 패턴이 pooling 단계에서 손실됨. EMG에서 제스처 전환 구간,
+   미세 근육 활성화 타이밍 등이 150 step으로 압축하면 정보가 뭉개진다.
+
+2. Transformer가 이 데이터 크기에서 BiLSTM을 넘지 못함:
+   클래스당 ~9k 윈도우. Transformer는 self-attention으로 전역 의존성을
+   학습하지만, 충분한 데이터 없이는 BiLSTM의 귀납 편향(순차 처리)보다
+   불리하다. Train acc 84.89%까지 올라간 반면 val/test가 낮은 것이
+   이 과적합 패턴을 보여준다.
+
+분리 진단: multi-scale conv 자체의 효과는 v23만으로는 판단 불가.
+Transformer + MaxPool이 병목인지, 아니면 multi-scale conv도 문제인지
+알려면 → v24: multi-scale conv + BiLSTM (MaxPool 제거, Transformer 제거).
+
+
+[v1~v23 전체를 관통하는 결론]
+
+v23의 가장 중요한 발견:
+  - BiLSTM 제거(→Transformer) + MaxPool은 역효과
+  - Multi-scale conv의 효과는 별도 검증 필요 (v24 예정)
+  - LLM 추천이 틀릴 수 있음 — 실험이 최종 판단자
+
+Gap 10.88p는 역대 최소이지만, easy 하락의 부산물.
+현재까지 유효한 최고 모델은 v10(69.10%, pooled BiLSTM 50ep).
+
+
+[향후 개선 후보]
+
+- (즉시) v24: Multi-scale conv + BiLSTM. Transformer/MaxPool 제거,
+  multi-scale conv 효과만 단독 검증. v8 대비 conv 블록만 교체.
+
+- (v24 이후) v25: Pooled 모델 + 피험자별 정규화. 현재 pooled 모델은
+  전체 평균(global) 정규화 사용. hard 피험자의 신호 통계가 다르므로
+  피험자별 정규화가 도움이 될 수 있음.
+
+- (장기) Wavelet/scalogram frontend: conv 입력 자체를 시간-주파수
+  표현으로 교체. 전처리 변경 필요.

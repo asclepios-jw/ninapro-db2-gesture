@@ -1,0 +1,189 @@
+"""
+v11: v8와 동일한 데이터/아키텍처/학습 레시피에 Center Loss만 추가해서 pooled
+베이스 모델을 처음부터 다시 학습. (v10 결론: v9 분산은 과적합이 아니었으므로,
+이번엔 "과적합 억제"가 아니라 "클래스 경계를 더 뚜렷하게"라는 다른 메커니즘으로
+시도. v3~v5의 FocalLoss+class weight 사고와는 무관한 손실 함수이므로 rest
+클래스를 억제할 메커니즘이 없지만, 안전을 위해 매 epoch마다 rest recall을
+모니터링한다.)
+"""
+import os
+import time
+import json
+import numpy as np
+import torch
+import torch.nn as nn
+from torch.utils.data import Dataset, DataLoader
+from sklearn.metrics import accuracy_score, f1_score, classification_report, confusion_matrix, recall_score
+from sklearn.preprocessing import LabelEncoder
+
+from models_v11 import SubjectAwareCNNLSTMAttention, CenterLoss
+
+DATA_DIR = "/mnt/data/medical_project/ninapro_db2_project/data_processed/v8"
+OUT_DIR = "/mnt/data/medical_project/ninapro_db2_project/results/v11"
+os.makedirs(OUT_DIR, exist_ok=True)
+
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+CENTER_LOSS_LAMBDA = 0.01
+REST_CLASS_RAW_LABEL = 0  # restimulus 0 = rest
+
+
+class EMGSubjectDataset(Dataset):
+    def __init__(self, X, y, s, mean, std):
+        Xn = (X - mean) / std
+        self.X = torch.from_numpy(Xn.transpose(0, 2, 1).astype(np.float32))
+        self.y = torch.from_numpy(y.astype(np.int64))
+        self.s = torch.from_numpy(s.astype(np.int64))
+
+    def __len__(self):
+        return len(self.y)
+
+    def __getitem__(self, idx):
+        return self.X[idx], self.y[idx], self.s[idx]
+
+
+def run_epoch(model, center_loss_fn, loader, ce_criterion, optimizer=None, lam=CENTER_LOSS_LAMBDA):
+    train = optimizer is not None
+    model.train() if train else model.eval()
+    total_loss, total_ce, total_center, total_correct, total_n = 0.0, 0.0, 0.0, 0, 0
+    all_preds, all_labels = [], []
+
+    with torch.set_grad_enabled(train):
+        for xb, yb, sb in loader:
+            xb, yb, sb = xb.to(DEVICE, non_blocking=True), yb.to(DEVICE, non_blocking=True), sb.to(DEVICE, non_blocking=True)
+            logits, feats = model(xb, sb, return_features=True)
+            ce_loss = ce_criterion(logits, yb)
+            c_loss = center_loss_fn(feats, yb)
+            loss = ce_loss + lam * c_loss
+
+            if train:
+                optimizer.zero_grad()
+                loss.backward()
+                optimizer.step()
+
+            bs = len(yb)
+            total_loss += loss.item() * bs
+            total_ce += ce_loss.item() * bs
+            total_center += c_loss.item() * bs
+            preds = logits.argmax(1)
+            total_correct += (preds == yb).sum().item()
+            total_n += bs
+            all_preds.extend(preds.cpu().numpy())
+            all_labels.extend(yb.cpu().numpy())
+
+    return {
+        "loss": total_loss / total_n, "ce": total_ce / total_n, "center": total_center / total_n,
+        "acc": total_correct / total_n, "labels": all_labels, "preds": all_preds,
+    }
+
+
+def main():
+    print("Loading data...")
+    X_train = np.load(os.path.join(DATA_DIR, "X_train.npy"))
+    y_train = np.load(os.path.join(DATA_DIR, "y_train.npy"))
+    s_train = np.load(os.path.join(DATA_DIR, "s_train.npy"))
+    X_val = np.load(os.path.join(DATA_DIR, "X_val.npy"))
+    y_val = np.load(os.path.join(DATA_DIR, "y_val.npy"))
+    s_val = np.load(os.path.join(DATA_DIR, "s_val.npy"))
+    X_test = np.load(os.path.join(DATA_DIR, "X_test.npy"))
+    y_test = np.load(os.path.join(DATA_DIR, "y_test.npy"))
+    s_test = np.load(os.path.join(DATA_DIR, "s_test.npy"))
+    mean = np.load(os.path.join(DATA_DIR, "norm_mean.npy"))
+    std = np.load(os.path.join(DATA_DIR, "norm_std.npy"))
+
+    le = LabelEncoder()
+    le.fit(y_train)
+    y_train_enc, y_val_enc, y_test_enc = le.transform(y_train), le.transform(y_val), le.transform(y_test)
+    n_classes = len(le.classes_)
+    n_channels = X_train.shape[2]
+    rest_enc_label = le.transform([REST_CLASS_RAW_LABEL])[0]
+    print(f"train={X_train.shape} n_classes={n_classes} n_channels={n_channels} rest_enc_label={rest_enc_label}")
+
+    train_ds = EMGSubjectDataset(X_train, y_train_enc, s_train, mean, std)
+    val_ds = EMGSubjectDataset(X_val, y_val_enc, s_val, mean, std)
+    test_ds = EMGSubjectDataset(X_test, y_test_enc, s_test, mean, std)
+
+    train_loader = DataLoader(train_ds, batch_size=512, shuffle=True, num_workers=4, pin_memory=True)
+    val_loader = DataLoader(val_ds, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True)
+    test_loader = DataLoader(test_ds, batch_size=1024, shuffle=False, num_workers=4, pin_memory=True)
+
+    model = SubjectAwareCNNLSTMAttention(n_channels=n_channels, n_classes=n_classes, n_subjects=40).to(DEVICE)
+    center_loss_fn = CenterLoss(n_classes, model.feature_dim).to(DEVICE)
+    ce_criterion = nn.CrossEntropyLoss(label_smoothing=0.1)
+
+    params = list(model.parameters()) + list(center_loss_fn.parameters())
+    optimizer = torch.optim.AdamW(params, lr=1e-3, weight_decay=1e-4)
+
+    epochs, patience = 30, 6
+    scheduler = torch.optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=epochs, eta_min=1e-6)
+
+    best_val_f1, best_state, patience_ctr = 0.0, None, 0
+    history = {"train_loss": [], "train_ce": [], "train_center": [], "train_acc": [],
+               "val_loss": [], "val_acc": [], "val_macro_f1": [], "val_rest_recall": []}
+
+    print(f"Start training on {DEVICE} with CenterLoss(lambda={CENTER_LOSS_LAMBDA})...")
+    t0 = time.time()
+    for epoch in range(1, epochs + 1):
+        ep_t0 = time.time()
+        tr = run_epoch(model, center_loss_fn, train_loader, ce_criterion, optimizer)
+        va = run_epoch(model, center_loss_fn, val_loader, ce_criterion, optimizer=None)
+        val_macro_f1 = f1_score(va["labels"], va["preds"], average="macro")
+        val_rest_recall = recall_score(va["labels"], va["preds"], labels=[rest_enc_label], average="micro")
+        scheduler.step()
+
+        history["train_loss"].append(tr["loss"]); history["train_ce"].append(tr["ce"])
+        history["train_center"].append(tr["center"]); history["train_acc"].append(tr["acc"])
+        history["val_loss"].append(va["loss"]); history["val_acc"].append(va["acc"])
+        history["val_macro_f1"].append(val_macro_f1); history["val_rest_recall"].append(val_rest_recall)
+
+        warn = "  [!! rest recall low !!]" if val_rest_recall < 0.5 else ""
+        print(f"Epoch {epoch:02d} | TrainLoss {tr['loss']:.4f} (CE {tr['ce']:.4f} + Center {tr['center']:.4f}) "
+              f"Acc {tr['acc']:.4f} | Val Acc {va['acc']:.4f} MacroF1 {val_macro_f1:.4f} "
+              f"RestRecall {val_rest_recall:.4f} | Time {time.time()-ep_t0:.1f}s{warn}")
+
+        if val_macro_f1 > best_val_f1:
+            best_val_f1, patience_ctr = val_macro_f1, 0
+            best_state = {k: v.cpu().clone() for k, v in model.state_dict().items()}
+            torch.save(best_state, os.path.join(OUT_DIR, "best_model_v11.pth"))
+        else:
+            patience_ctr += 1
+            if patience_ctr >= patience:
+                print(f"Early stopping at epoch {epoch}")
+                break
+
+    train_time = time.time() - t0
+    model.load_state_dict(best_state)
+
+    te = run_epoch(model, center_loss_fn, test_loader, ce_criterion, optimizer=None)
+    test_acc = te["acc"]
+    test_f1 = f1_score(te["labels"], te["preds"], average="macro")
+    test_weighted_f1 = f1_score(te["labels"], te["preds"], average="weighted")
+    test_rest_recall = recall_score(te["labels"], te["preds"], labels=[rest_enc_label], average="micro")
+
+    print(f"Test Acc: {test_acc:.4f}  Test Macro-F1: {test_f1:.4f}  Rest recall: {test_rest_recall:.4f}")
+
+    report = classification_report(te["labels"], te["preds"], zero_division=0)
+    with open(os.path.join(OUT_DIR, "report.txt"), "w") as f:
+        f.write(report)
+    cm = confusion_matrix(te["labels"], te["preds"])
+    np.save(os.path.join(OUT_DIR, "confusion_matrix.npy"), cm)
+
+    result = {
+        "model": "SubjectAwareCNNLSTMAttention_v11_centerloss",
+        "center_loss_lambda": CENTER_LOSS_LAMBDA,
+        "train_time_sec": train_time,
+        "best_val_macro_f1": best_val_f1,
+        "test_accuracy": test_acc,
+        "test_macro_f1": test_f1,
+        "test_weighted_f1": test_weighted_f1,
+        "test_rest_recall": test_rest_recall,
+        "n_epochs_run": len(history["train_loss"]),
+    }
+    with open(os.path.join(OUT_DIR, "result_v11.json"), "w") as f:
+        json.dump(result, f, indent=2)
+    with open(os.path.join(OUT_DIR, "history_v11.json"), "w") as f:
+        json.dump(history, f, indent=2)
+    print(f"Saved results to {OUT_DIR}")
+
+
+if __name__ == "__main__":
+    main()

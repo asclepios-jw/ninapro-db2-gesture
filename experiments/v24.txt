@@ -1,0 +1,124 @@
+================================================================
+v24 — Multi-scale Conv + BiLSTM: multi-scale conv 자체가 문제임을 확인
+================================================================
+
+[이 버전을 시작한 계기]
+
+v23(Multi-scale Conv + Transformer + MaxPool)이 v10 대비 -1.37p로 실패.
+실패 원인이 Transformer/MaxPool 탓인지, multi-scale conv 탓인지 분리 불가.
+→ v24: Transformer 제거, MaxPool 제거, BiLSTM 복귀. multi-scale conv만 단독 검증.
+
+"v10과 conv 블록만 다른 모델" 로 설계해 순수 multi-scale 효과를 측정.
+
+
+[방법: code/train_cnn_v24.py, code/models_v24.py]
+
+아키텍처:
+  Multi-scale Conv (v23과 동일 블록):
+    branch1: Conv1d(24, 64, k=3,  dilation=1, pad=1)    → 1.5ms RF
+    branch2: Conv1d(24, 64, k=15, dilation=2, pad=14)   → 14.5ms RF
+    branch3: Conv1d(24, 64, k=51, dilation=4, pad=100)  → 100.5ms RF
+    concat(192ch) → Conv1d(192, 128, k=1) + BN + ReLU   → (B, 128, 600)
+  BiLSTM(128, 128, 2L, bidir, dropout=0.3)               → (B, 600, 256)
+  Attention weighted sum                                  → (B, 256)
+  SubjectEmbedding(40, 32) concat                        → (B, 288)
+  Dropout(0.4) + Linear(288, 50)
+
+파라미터 수: 806,963 (v8 추정 ~700k 대비 소폭 증가)
+학습: AdamW(1e-3, 1e-4), CosineAnnealingLR, 50ep, patience=8, batch=256
+
+
+[재현 정보]
+
+  python /mnt/data/medical_project/ninapro_db2_project/code/train_cnn_v24.py
+  # 모델: results/v24/best_model_v24.pth
+  # 결과: results/v24/result_v24.json
+
+
+[비용 원장: 시간/디스크/GPU]
+
+  학습 시간: 394.6분(6.6시간). BiLSTM 600step 50ep 기준 예상 범위 내.
+  결과물: results/v24/
+
+
+[결과]
+
+  학습 곡선: val_f1 ep44에서 0.5334 달성 후 완만히 수렴. 50ep 완주(patience 미소진).
+  tr_acc 78.54%로 v10(~85%) 대비 낮음 → multi-scale conv가 학습 자체를 어렵게 함.
+
+  테스트 결과:
+
+                      v8(30ep)   v10(50ep)   v23(MS+Tfm)   v24(MS+BiLSTM)
+  전체 acc             68.69%     69.10%       67.73%         64.37%
+  Hard acc             57.52%     ~58%         58.21%         52.60%
+  Easy acc             70.29%     ~71%         69.09%         66.05%
+  Gap (easy-hard)      12.77p     ~13p         10.88p         13.45p
+  Macro-F1             56.92%     —            56.30%         49.72%
+
+
+[기대와 실제가 어떻게 달랐는가]
+
+기대: Transformer/MaxPool이 문제였다면 BiLSTM 복귀로 v10 수준 회복 기대.
+     multi-scale conv 효과가 있다면 v10(69.10%) 초과 기대.
+
+실제: v10 대비 -4.73p. v23(67.73%)보다도 -3.36p 더 낮다.
+multi-scale conv + BiLSTM이 가장 나쁜 조합임이 드러났다.
+
+
+[원인 분석: multi-scale conv가 해로운 이유]
+
+v23과 v24를 합쳐 분리 검증 완료:
+
+  v23: MS conv + Transformer  → 67.73%  (v10 대비 -1.37p)
+  v24: MS conv + BiLSTM       → 64.37%  (v10 대비 -4.73p)
+
+두 실험 모두 v8/v10보다 낮다 → multi-scale conv 자체가 문제.
+
+근본 원인:
+
+1. 계층적 특징 추출 부재.
+   v8: Conv1d(24→64, k=3) → Conv1d(64→128, k=3) — 계층적으로 쌓음.
+     1층: 24ch 원시 신호 → 64ch 로컬 패턴
+     2층: 64ch 로컬 패턴 → 128ch 중간 수준 패턴
+   v24: 세 브랜치 모두 24ch 원시 신호에서 직접 출발. 계층성 없음.
+   BiLSTM이 처리해야 할 입력의 복잡도가 v8보다 높아진다.
+
+2. k=51 브랜치의 과도한 zero-padding.
+   dilation=4, k=51 → padding=100. 600 timestep 시퀀스에서 양끝 100step씩
+   zero로 채워지므로 실질적으로 약 33%가 패딩 영역. 경계 아티팩트 발생.
+
+3. 1×1 conv 병목.
+   세 브랜치(192ch)를 1×1 conv로 128ch로 압축. 위치 정보 없는 채널 믹싱만
+   수행하므로 다른 스케일 간 공간적 관계가 손실됨.
+
+결론: v8의 단순 Conv1d(k=3) × 2가 EMG sEMG에 더 적합하다. 계층적 특징 추출이
+parallel multi-scale보다 이 데이터에서 우월하다.
+
+
+[v1~v24 전체를 관통하는 결론]
+
+아키텍처 탐색 결과 요약:
+
+  v8~v10 : Conv1d(k=3)×2 + BiLSTM + SubjEmb → 68.69~69.10%  ← 최고
+  v11~v17: 정규화/증강 계열                  → 모두 v8 이하
+  v18~v20: DANN 계열                         → 모두 v8 이하
+  v21~v22: 개별 모델 (30/50ep)               → 69.00~69.08% (pooled ≈ 개별)
+  v23    : MS conv + Transformer + MaxPool   → 67.73%
+  v24    : MS conv + BiLSTM                  → 64.37%  ← 최악
+
+v8의 단순 아키텍처가 24버전의 실험을 거쳐도 여전히 최적에 가깝다.
+남은 개선 방향은 아키텍처가 아닌 데이터/전처리 축이다.
+
+
+[향후 개선 후보]
+
+- (최우선) 전처리 팀 새 데이터 도착 대기 (DB2_output.zip 재전송 중).
+  새 전처리 데이터로 v10 아키텍처(검증된 최고)를 재학습하는 것이
+  현시점 가장 높은 기대 효과.
+
+- (새 데이터 전) 옵션B: Pooled 모델 + 피험자별 정규화.
+  현재 pooled 모델(v8~v10)은 전체 평균(global norm_mean)으로 정규화.
+  피험자별 통계로 교체하면 hard 피험자 성능 개선 여지 있음.
+  코드 변경만 필요, 재전처리 불필요.
+
+- (장기) Hard 피험자 oversampling (2~3×) + focal loss 조합.

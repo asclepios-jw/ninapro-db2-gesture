@@ -1,0 +1,185 @@
+================================================================
+v33 — v32 체크포인트 기반 per-subject fine-tuning: 68.89%
+       v10(69.10%)까지 -0.21p — Hard acc 역전 (+0.44p)
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v32(68.70%)가 v28 전처리 + v8 arch 조합으로 v8 pooled(68.68%)를 처음 넘어섰다.
+v31에서 v30(68.25%) fine-tuning이 +0.13p에 그쳤지만,
+v32는 base 자체가 더 좋고 특히 hard acc가 높아(57.84% vs 57.04%)
+fine-tuning 과적합 위험이 낮을 것으로 판단.
+
+v33 = v31 방식 그대로, BASE_CKPT만 v32로 교체.
+  BASE_CKPT = results/v32/best_model_v32.pth
+  DATA_DIR  = 전처리전달_v28/
+  freeze_cnn, Adam(1e-4), 15ep, patience=5, batch=128
+
+
+[2] 전 버전(v32)과 달라진 점
+
+v32: pooled 학습 (40명 전체 한 번에)
+v33: per-subject fine-tuning (v32 체크포인트 매번 재로드, 피험자별 독립 학습)
+
+v31과의 차이:
+  v31: BASE_CKPT = results/v30/best_model_v30.pth, DATA_DIR = 전처리전달_10hz
+  v33: BASE_CKPT = results/v32/best_model_v32.pth, DATA_DIR = 전처리전달_v28
+  나머지 동일: freeze_cnn, FT_LR=1e-4, FT_EPOCHS=15, FT_PATIENCE=5, FT_BATCH=128
+
+
+[3] 변경 이유 + 기대했던 효과
+
+v31 분석에서 확인한 패턴:
+  - v30(팀 10Hz) base의 fine-tuning 이득: +0.13p
+  - 원인: 팀 전처리(post-windowing norm)가 이미 per-subject 특성을 희석
+  - Hard subjects에서 역효과: v31 hard acc v30 base 대비 -0.31p
+
+v32(v28 전처리)는 12ch EMG만 먼저 정규화하므로,
+팀 전처리보다 피험자 개인 특성이 더 많이 남아있다.
+→ subject_emb + LSTM fine-tuning의 효과가 더 클 것.
+
+기대: +0.20~0.30p → 68.90~69.00%
+      hard acc 개선도 v31보다 나을 것 (v32 base hard acc 자체가 높음).
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: +0.20~0.30p
+실제: **+0.21p** (68.70% → 68.89%)  — 기대 범위 하단 달성.
+
+v31(+0.13p) 대비 fine-tuning 이득이 1.6배로 증가. 가설 부분 검증.
+
+피험자별 분석:
+  개선된 피험자: 23/40
+  악화된 피험자: 17/40
+
+Hard subjects 개별 delta:
+  s04:  -0.72p  ← 악화 (v31과 유사 패턴)
+  s07:  -0.56p  ← 악화 (v31과 유사 패턴)
+  s26:  +1.43p  ← 대폭 개선 (v31은 -0.94p였음 — 반전!)
+  s28:  +0.78p  ← 개선 (v31과 유사)
+  s31:  +1.27p  ← 대폭 개선 (v31은 -0.56p였음 — 반전!)
+  Hard 평균: 58.28% (v32 base 57.84% 대비 **+0.44p**)
+
+v31에서 hard fine-tuning이 -0.31p였던 것이 v33에서 +0.44p로 반전.
+s26과 s31이 핵심: v31에서 크게 악화됐던 두 피험자가 v33에서 대폭 개선.
+→ v28 전처리(normalize→env)가 hard subjects의 신호 품질을 충분히 개선해
+   fine-tuning이 피험자별 특성을 오히려 더 잘 학습하게 됨.
+
+여전히 악화되는 피험자 존재:
+  s21 -1.32p, s23 -1.21p, s08 -1.07p, s40 -0.95p, s15 -0.89p
+  패턴: 주로 base_acc가 높은 easy subjects (s08=0.812, s40=0.836, s15=0.766)
+  → 이미 잘 분류되는 피험자에게 fine-tuning이 오히려 노이즈에 과적합.
+
+Base acc 재현 검증:
+  v33 per-subject base mean: 68.68% (v32 pooled test 68.70%와 -0.02p 차이)
+  → 미세 차이는 per-subject mean vs pooled test의 윈도우 수 차이. 정상.
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음.
+소요 시간: 27.8분 (v31의 22.6분보다 약간 길었음 — v28 데이터 로드 오버헤드 추정).
+
+주목할 관찰:
+  s04(-0.72p)와 s07(-0.56p)는 v31, v33 모두에서 fine-tuning 시 일관되게 악화.
+  이 두 피험자는 hard subjects 중에서도 특히 데이터 품질이 낮을 가능성.
+  (신호 자체의 문제로 fine-tuning 데이터가 유의미하지 않을 수 있음)
+
+  반면 s26(+1.43p)과 s31(+1.27p)은 v28 전처리 덕에 신호 품질이 충분해져
+  fine-tuning 효과가 크게 나타남. 전처리 품질이 fine-tuning 효과의 전제조건임을 재확인.
+
+
+[6] 이번 버전에서 배운 점
+
+**전처리 품질이 fine-tuning 효과의 전제조건이다.**
+
+  v31: 팀 전처리(post-windowing norm) → fine-tuning +0.13p, hard -0.31p
+  v33: v28 전처리(normalize→env) → fine-tuning +0.21p, hard +0.44p
+
+  더 좋은 전처리 위에서 fine-tuning하면:
+  (1) 전체 이득이 커지고
+  (2) hard subjects에서 역효과가 줄어들거나 오히려 개선됨.
+
+**Hard subjects 내에서도 이질성이 크다.**
+  s04, s07: 전처리 개선에도 fine-tuning 시 일관 악화 → 데이터 자체의 한계 가능성.
+  s26, s31: v31에서 악화됐지만 v33에서 대폭 개선 → 전처리에 민감한 유형.
+  s28: 두 버전 모두 개선 → fine-tuning에 적합한 피험자.
+
+  → Hard subjects를 하나의 그룹으로 묶어 다루기보다
+    피험자별 특성을 구분한 접근이 필요할 수 있다.
+
+**현재 최고 성능 체계:**
+  v28 전처리 + v8 arch + per-subject fine-tuning = 68.89%
+  v10(69.10%)까지 -0.21p.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+1. **(v34, 즉시) v32 pooled 학습 시 hard subject oversampling**
+   s04, s07의 fine-tuning 역효과를 fine-tuning이 아닌 pooled 학습에서 해결.
+   hard subjects {4,7,26,28,31}을 2~3× 오버샘플링.
+   기대: hard acc 57.84%(v32) → 60%+ / overall +0.3~0.5p.
+   이 위에 v33 방식 fine-tuning까지 적용하면 69% 돌파 유력.
+
+2. **(v34 대안) fine-tuning 하이퍼파라미터 조정**
+   현재 문제: base_acc가 높은 easy subjects(s08, s21, s23, s40)에서 fine-tuning 과적합.
+   개선: 피험자별 base_acc에 따라 FT_LR 또는 FT_EPOCHS 조정.
+     - base_acc > 0.75 → FT_LR = 5e-5 (더 조심스럽게)
+     - base_acc < 0.65 → FT_LR = 1e-4 (현행 유지)
+   기대: easy subjects 과적합 방지 + hard subjects 개선 유지 → +0.1~0.2p 추가.
+
+3. **(중기) 전처리 완성형: v28 + 24ch 공동 정규화**
+   v32의 X_train mean=0.2440(non-zero) 문제 해결.
+   normalize12ch→env→stack24ch 이후 24ch 전체를 다시 per-subject normalize.
+   → mean≈0 확보, 학습 안정성 개선, early stop ep40 → ep50 완주 기대.
+   기대: v32 대비 +0.1~0.2p → fine-tuning까지 합산 시 69.1~69.3%.
+
+4. **(장기) subject-specific fine-tuning 전략 차별화**
+   s04, s07처럼 fine-tuning이 역효과인 피험자: pooled 체크포인트 그대로 사용.
+   s26, s31처럼 fine-tuning이 큰 효과인 피험자: 현행 유지.
+   피험자별 val_f1 기준으로 fine-tuned vs base 중 더 나은 것을 선택하는
+   adaptive 전략 → 이론상 +0.3~0.5p 추가 가능.
+
+
+[8] 재현 정보
+
+  python code/finetune_v33.py
+
+  DATA_DIR  = /mnt/data/medical_project/ninapro_db2_project/전처리전달_v28
+  BASE_CKPT = /mnt/data/medical_project/ninapro_db2_project/results/v32/best_model_v32.pth
+  OUT_DIR   = /mnt/data/medical_project/ninapro_db2_project/results/v33
+
+  결과: results/v33/result_v33.json
+  주의: v32 체크포인트(best_model_v32.pth) 존재 필요.
+
+
+[9] 비용 원장
+
+  학습 시간 : 27.8분 (v31의 22.6분보다 약 5분 더 걸림)
+  데이터     : 전처리전달_v28/ (이미 존재, 추가 전처리 없음)
+  결과물     : results/v33/result_v33.json
+  GPU 메모리 : 측정하지 않음 (batch=128, 문제 없었음)
+
+  비용 관련 특이사항: 없음.
+
+
+[전체 버전 비교표 (누적)]
+
+  버전  데이터                아키텍처    방식         acc       hard acc
+  ────  ────────────────────  ──────────  ──────────  ──────    ──────────
+  v25   팀 5Hz                단순        pooled      62.58%        —
+  v27   팀 10Hz               단순        pooled      63.56%    51.80%
+  v28   팀 10Hz (norm→env)    단순        pooled      64.69%        —
+  v29   v8 전처리             단순        pooled      63.57%    51.97%
+  v8    v8 전처리             v8 arch     pooled      68.68%      ~58%
+  v30   팀 10Hz               v8 arch     pooled      68.25%    57.04%
+  v31   팀 10Hz               v8 arch     fine-tuned  68.38%    56.73%
+  v32   v28 전처리            v8 arch     pooled      68.70%    57.84%
+  v33   v28 전처리            v8 arch     fine-tuned  68.89%    58.28%  ← 현재
+  v10   v8 전처리             v8 arch     fine-tuned  69.10%      ~58%
+
+  v10까지 남은 거리: -0.21p
+  팀 데이터 최고: v33(68.89%)
+  hard acc 추이: 51.80%(v27) → 57.04%(v30) → 57.84%(v32) → 58.28%(v33) ← 꾸준한 개선

@@ -4,7 +4,7 @@
 
 KBESA(큐베사) 바이오센서팀 프로젝트(2026-06 ~ 08)이고, 저는 Algorithm Leader를 맡았습니다. v1부터 v64까지 64번의 실험을 거쳤습니다.
 
-> **이 레포의 범위**: 최종 모델 아키텍처 코드, 초기 베이스 파이프라인 노트북, 최종 모델(v64) 문서입니다. 학습·앙상블·추론 스크립트(`stability_v57.py`, `inference_v59.py` 등)는 아직 포함하지 않았습니다.
+> **이 레포의 범위**: v1~v64 전체 실험 코드(`code/`, 95개)와 버전별 실험 기록(`experiments/`), 최종 모델 문서입니다. 학습된 가중치(.pth)와 전처리된 데이터는 용량 문제로 포함하지 않았습니다.
 
 ## 결과 (v64, 40명 통합 · 사용 중 개인 라벨 0)
 
@@ -63,12 +63,34 @@ champion 앙상블 8개 중 3개가 이 구조이고, 나머지는 기반(v8)·�
 ## 폴더
 
 ```
-model/final_model_cnn_lstm_attention.py  최종 모델 구조 (v44): CNN + 피험자 임베딩 + BiLSTM + Attention, 시간영역 특징(RMS·MAV·WL·ZC·SSC) 브랜치 결합. 약 82만 파라미터
-notebooks/01_baseline_pipeline.ipynb   초기 베이스 파이프라인: .mat 로딩 → 필터·윈도잉 → 특징 → SVM / CNN-1D / CNN-LSTM → 평가 → 실시간 분류기 틀
-docs/project_summary_v64.txt           v1~v64 프로젝트 요약 (레버, 막다른 길, 교훈)
-docs/final_model_spec_v64.txt          최종 모델 상세 명세 (전처리, 아키텍처, 학습, 앙상블, 성능, 재현 절차)
-docs/final_model_code_walkthrough.md   최종 모델 코드를 Python 입문자에게 설명한 글
+model/final_model_cnn_lstm_attention.py  최종 모델 구조 (= code/models_v44.py). 바로 찾기 쉽게 따로 둔 복사본
+code/                                    v1~v64 실험 코드 전체 (파일 이름의 vN = 실험 버전)
+experiments/                             버전별 실험 기록 v1.txt ~ v64.txt: 가설, 바꾼 것, 결과, 다음 방향
+notebooks/01_baseline_pipeline.ipynb     프로젝트 전 단일 피험자 베이스 파이프라인 (S1만, 82.7%)
+docs/project_summary_v64.txt             v1~v64 프로젝트 요약 (레버, 막다른 길, 교훈)
+docs/final_model_spec_v64.txt            최종 모델 상세 명세 (전처리, 아키텍처, 학습, 앙상블, 성능, 재현 절차)
+docs/final_model_code_walkthrough.md     최종 모델 코드를 Python 입문자에게 설명한 글
+docs/performance_report.md               초기 버전 성적표
+docs/troubleshooting_log.md              환경·학습 문제 해결 기록
+docs/Dockerfile, setup_container.sh      학습 환경 (Python 3.13, PyTorch 2.12 + CUDA 13.0, RTX 2070)
 ```
+
+### 최종 파이프라인에 쓰인 파일
+
+| 단계 | 파일 |
+|---|---|
+| 데이터·전처리 | `code/data_utils.py`, `code/build_dataset_v28.py` (→ 24채널 300ms 창, 피험자별 정규화) |
+| 모델 정의 | `code/models_v8.py`(기반), `code/models_v44.py`(시간영역 특징), `code/models_v45.py`(주파수 특징), `code/models_v41.py`(잔차 CNN) |
+| 학습 | `code/train_cnn_v40.py`(기반 레시피), `code/train_cnn_v61.py`·`code/train_cnn_chdrop.py`(채널 드롭아웃, robust3) |
+| 앙상블·통계 | `code/stability_v57.py`(champion 8모델 구성, 신뢰구간·seed 분산) |
+| 배포·추론 | `code/deploy_v58.py`(효율 곡선), `code/inference_v59.py`(추론 API, seed 42 재현 검증) |
+| 강건성 | `code/robustness_v60.py`(교란 프로파일), `code/robust_ensemble_v64.py`(robust3 검증) |
+
+### 실행 전 주의
+- 코드의 데이터·결과 경로는 학습에 쓴 서버 기준(`/mnt/data/medical_project/...`)으로 적혀 있습니다. 실행하려면 각 스크립트 상단의 `DATA_DIR` 등 경로를 바꿔야 합니다.
+- 실행 순서는 [`docs/final_model_spec_v64.txt`](docs/final_model_spec_v64.txt) 15절(재현 절차)에 있습니다.
+- 필요 패키지: `docs/requirements.txt` + PyTorch (Dockerfile 참고)
+- `code/ask_minimax.py`, `code/evaluate_with_llm.py`는 외부 LLM 검토용 스크립트이고, API 키는 환경변수(`NVIDIA_API_KEY`)에서 읽습니다.
 
 ## 데이터
 [Ninapro DB2](https://ninapro.hevs.ch/instructions/DB2.html) — 40명, 49개 동작 + rest, Delsys Trigno 12채널 sEMG, 2 kHz. 용량이 커서 레포에 포함하지 않으니 공식 사이트에서 받아 `data/`에 둡니다 (`S1_E1_A1.mat` 형식).

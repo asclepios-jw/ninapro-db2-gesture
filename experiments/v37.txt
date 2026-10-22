@@ -1,0 +1,178 @@
+================================================================
+v37 — v36 base + adaptive per-subject fine-tuning: 69.83%
+       증강과 fine-tuning의 시너지 — 기대 초과 (+0.58p)
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v36(69.25%)이 증강+focal로 처음 v10을 넘었지만, fine-tuning은 아직 얹지
+않은 pooled 상태였다. v35에서 검증된 adaptive fine-tuning(피험자별 base vs
+fine-tuned 중 val_f1 기준 선택)을 v36 위에 그대로 적용하는 것이
+가장 빠르고 확실한 다음 수(약 28분, 가성비 최고).
+
+핵심 질문: 증강으로 이미 좋아진 base 위에서도 fine-tuning이 유효할까?
+          아니면 증강과 fine-tuning의 효과가 겹쳐서 이득이 줄어들까?
+
+
+[2] 전 버전(v36)과 달라진 점
+
+v36: pooled 학습 (증강 + focal), 40명 한 번에.
+v37: v36 체크포인트를 피험자별로 fine-tuning 후 adaptive 선택.
+
+v35와의 차이:
+  v35: BASE_CKPT = v32 (증강 없는 pooled)
+  v37: BASE_CKPT = v36 (증강+focal pooled)
+  손실: v37은 focal loss(γ=2)로 통일 (v36과 일관, v35는 label smoothing)
+  나머지 동일: freeze_cnn, Adam(1e-4), 15ep, patience=5, batch=128
+  fine-tuning 자체는 증강 없음 (per-subject 소량 데이터, v35 방식 유지)
+
+
+[3] 변경 이유 + 기대했던 효과
+
+freeze_cnn fine-tuning의 원리:
+  CNN backbone은 동결, subject_emb+LSTM+Attention+fc만 피험자별 재학습.
+  v36의 CNN은 증강으로 학습되어 더 일반화된 특징 추출기가 됨.
+  → 그 위에서 피험자별 상위 레이어를 미세 조정하면 개인화 효과.
+
+기대: v35에서 v32→adaptive가 +0.29p였으므로 유사한 +0.2~0.3p.
+     → 69.25% + 0.25p ≈ 69.4~69.6%.
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: +0.2~0.3p → 69.4~69.6%
+실제: **+0.58p** (v36 base 69.24% → v37 69.83%) — 기대의 약 2배.
+
+  overall : 69.83%  (v36 base 69.24% 대비 +0.58p)
+  hard acc: 58.87%  (v36 58.71% 대비 +0.16p)
+  easy acc: 71.39%  (v36 70.75% 대비 +0.64p)
+  선택 통계: FT 33명 / BASE 7명 (BASE: s11,s14,s18,s23,s24,s26,s35)
+
+**중요 발견: fine-tuning 이득이 v35(+0.29p)보다 2배 컸다 (+0.58p).**
+
+왜? 증강과 fine-tuning은 겹치는 게 아니라 시너지를 낸다:
+  - 증강은 CNN backbone을 더 일반화된 특징 추출기로 만든다 (v36의 역할).
+  - 더 좋은 frozen backbone 위에서 상위 레이어를 fine-tuning하면
+    개인화가 더 효과적으로 작동한다.
+  - 즉 "일반화된 공통 특징(증강) + 피험자별 개인화(fine-tuning)"의
+    역할 분담이 명확해져 각자 최대 효과.
+
+v35 대비 피험자별 이득 패턴:
+  이번엔 easy subjects가 크게 개선(+0.64p)되고 hard는 소폭(+0.16p).
+  → 증강이 이미 hard를 v36 단계에서 끌어올렸으므로(57.84→58.71)
+    fine-tuning 단계에서는 easy의 개인화 여지가 더 컸던 것으로 해석.
+
+val≠test 미스 사례:
+  s31(H): FT 선택했으나 test에서 base 0.5507 > ft 0.5458 (val이 틀림).
+  s07(H): FT 선택, base 0.6239 ≈ ft 0.6235 (거의 동일).
+  피할 수 없는 소수 케이스지만 전체 평균에 미치는 영향은 미미.
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음.
+소요 시간: 29.1분 (v35의 28.4분과 거의 동일).
+
+주목할 관찰:
+  v36 base per-subject mean(69.24%)이 v36 pooled test(69.25%)와 정확히 일치.
+  → 재현성 확인, 증강 체크포인트가 올바르게 로드됨.
+
+  BASE 선택 7명은 v35(8명)보다 적음.
+  → 증강된 base가 더 강해서 fine-tuning이 도움되는 피험자가 늘어남(33명).
+
+
+[6] 이번 버전에서 배운 점
+
+**증강과 fine-tuning은 시너지 관계다 (효과가 겹치지 않는다).**
+
+  단독 효과:
+    증강만 (v32→v36):        +0.55p
+    fine-tuning만 (v32→v35): +0.29p
+  결합 효과:
+    증강+fine-tuning (v32→v37): +1.13p (68.70→69.83)
+
+  만약 두 효과가 독립적으로 더해진다면 0.55+0.29=0.84p여야 하는데
+  실제는 +1.13p로 더 컸다. → 초가법적(super-additive) 시너지.
+
+  이유: 증강이 backbone을 개선 → fine-tuning의 출발점(base)이 좋아짐
+        → 같은 fine-tuning이 더 큰 이득 (v35 +0.29p vs v37 +0.58p).
+
+**일반화된 원칙:**
+"일반화 개선(증강)과 개인화(fine-tuning)는 역할이 다르므로 함께 쓸 때
+ 각자의 효과를 온전히 발휘하며, 순차 적용 시 상승 효과가 배가된다."
+
+**현재 성능: 69.83%. v10(69.10%)을 +0.73p 앞섬.**
+  전체 여정(v25 62.58% → v37 69.83%): +7.25p.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+1. **(v38, 우선) 장기 학습 (100ep)로 v36 재학습**
+   v36이 50ep 조기 종료 없이 끝났고 ep49까지 상승 중이었음 → 미수렴.
+   변경: N_EPOCHS=100, T_max=100 (스케줄 동반 조정 필수), patience=15.
+   → 더 좋은 pooled base 확보 후 v37 방식 fine-tuning 재적용.
+   기대: v36 +0.2~0.4p → fine-tuning까지 70.0~70.3% 가능.
+
+2. **(v39, 단기) 증강 강도 튜닝**
+   현재 보수적. hard가 잘 반응했으므로 magwarp σ 0.20→0.30,
+   timewarp σ 0.15→0.25, mixup α 0.20→0.30 실험.
+   과하면 역효과 → val로 최적점 탐색. 기대: +0.1~0.3p.
+
+3. **(중기, 2안) 아키텍처 업그레이드 + 동일 증강**
+   증강이 v8 arch와 시너지를 냄을 확인(v36, v37).
+   더 강한 아키텍처(multi-scale conv, Transformer encoder, residual CNN)에
+   같은 증강+focal+adaptive 파이프라인 적용.
+   증강된 강한 모델은 상승폭이 더 클 가능성.
+   기대: +0.5~1.5p (분산 큼). 현재 파이프라인(v38/v39)을 굳힌 뒤 착수.
+
+4. **(중기) 전극 shift 증강 추가**
+   DB2 전완 둘레 전극에 한해 순환 shift → 착용 편차 직접 모사.
+   전극 배치가 완전한 링이 아니므로 신중히 설계.
+
+
+[8] 재현 정보
+
+  python code/finetune_v37.py
+
+  DATA_DIR  = /mnt/data/medical_project/ninapro_db2_project/전처리전달_v28
+  BASE_CKPT = /mnt/data/medical_project/ninapro_db2_project/results/v36/best_model_v36.pth
+  OUT_DIR   = /mnt/data/medical_project/ninapro_db2_project/results/v37
+
+  결과: results/v37/result_v37.json
+  주의: v36 체크포인트(best_model_v36.pth) 존재 필요.
+        fine-tuning은 확률적 → 피험자별 선택(FT/BASE) 및 전체 평균 ±0.1p 분산.
+
+
+[9] 비용 원장
+
+  학습 시간 : 29.1분 (v35 28.4분과 거의 동일)
+  데이터     : 전처리전달_v28/ (이미 존재)
+  결과물     : results/v37/result_v37.json
+  GPU 메모리 : 측정하지 않음 (batch=128)
+
+  비용 관련 특이사항:
+    29분 만에 v36(69.25%) → v37(69.83%) +0.58p.
+    증강(v36, 108분)에 비하면 fine-tuning은 시간 대비 효율이 훨씬 높음.
+
+
+[전체 버전 비교표 (누적)]
+
+  버전  방식                                  acc       hard    macroF1
+  ────  ────────────────────────────────────  ──────    ──────  ───────
+  v25   팀 5Hz, 단순 arch, pooled             62.58%      —       —
+  v32   v28 전처리, v8 arch, pooled           68.70%    57.84%  0.5718
+  v33   + fine-tuned                          68.89%    58.28%    —
+  v35   + adaptive fine-tuned                 68.99%    58.76%    —
+  v10   (v8 데이터, fine-tuned) ← 기존 목표    69.10%    ~58%      —
+  v36   + 증강 + focal (pooled)               69.25%    58.71%  0.5874
+  v37   v36 + adaptive fine-tuned             69.83%    58.87%    —      ← 최고
+
+  ★ v10 대비 +0.73p. 전체 여정 +7.25p (62.58 → 69.83).
+
+  누적 기여 분석 (v32 → v37):
+    증강 + focal loss    : +0.55p  (v32→v36)
+    adaptive fine-tuning : +0.58p  (v36→v37, 증강과 시너지로 v35의 2배)
+    합계                 : +1.13p  (초가법적)
+
+  다음 목표: v38 장기 학습 → 70% 돌파.

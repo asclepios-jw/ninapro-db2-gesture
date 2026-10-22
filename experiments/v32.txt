@@ -1,0 +1,185 @@
+================================================================
+v32 — v28 전처리(normalize→env) + v8 아키텍처: 68.70%
+       v30 대비 +0.45p — 기대(+1p)의 절반, Hard acc +0.80p
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v31(68.38%)에서 fine-tuning 이득이 +0.13p에 그치며 69% 돌파가 막혔다.
+다음 질문: "전처리를 개선하면 v8 arch에서도 효과가 있을까?"
+
+v28에서 확인된 사실:
+  단순 arch 기준, v28(normalize→env 순서)이 v27(env→normalize 순서) 대비 +1.13p.
+  이 차이가 v8 arch에서도 유사하게 나타난다면 68.25% + ~1p = 69~69.5% 달성 가능.
+
+v32는 v30과 DATA_DIR 하나만 다르다:
+  v30: DATA_DIR = 전처리전달_10hz/    (팀 방식: filter→|EMG|→env→stack→window→norm)
+  v32: DATA_DIR = 전처리전달_v28/     (v28 방식: filter→norm12ch→|norm|→env→stack→window)
+
+v28 데이터는 이미 존재(재전처리 불필요). 아키텍처/하이퍼파라미터는 v30과 완전 동일.
+
+
+[2] 전 버전(v30~v31)과 달라진 점
+
+v30 대비 변경:
+  - DATA_DIR: 전처리전달_10hz → 전처리전달_v28
+  - 나머지 모두 동일: models_v8.SubjectAwareCNNLSTMAttention, AdamW 1e-3,
+    CosineAnnealingLR(T_max=50, eta_min=1e-6), 50ep, patience=8, batch=256
+
+전처리 파이프라인 비교:
+  v30(팀 방식): filter(12ch) → |raw EMG|(12ch) → lowpass env(12ch) → stack 24ch
+                → window → per-subject normalize(24ch jointly)
+  v32(v28 방식): filter(12ch) → per-subject normalize(12ch, train rep) → |norm EMG|
+                 → lowpass env(12ch) → stack 24ch → window
+                 ※ 이미 정규화됨, 추가 normalize 없음
+
+수치 차이:
+  v30 X_train: mean≈0.00, std≈1.08  (24ch jointly normalized → 거의 zero-mean)
+  v32 X_train: mean=0.2440, std=0.8545  (env채널이 |norm_emg|라 non-negative → 전체 mean↑)
+
+
+[3] 변경 이유 + 기대했던 효과
+
+v28에서 normalize→env 순서가 +1.13p를 준 이유(이론):
+  EMG 신호를 먼저 정규화한 후 절댓값을 취하면,
+  정규화된 신호는 피험자 간 스케일이 통일된 상태이므로
+  envelope이 더 일관된 신호 특성을 반영한다.
+
+  반면 팀 방식(|raw EMG| → env → normalize)은 raw signal의 스케일 차이가
+  envelope 형태에 그대로 영향을 미친 후 정규화가 이루어진다.
+
+기대: 단순 arch의 +1.13p가 v8 arch에서도 유사하게 나타나 69~69.5% 달성.
+      Hard subjects는 env 품질 개선의 수혜를 더 받을 것으로 예상.
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: +1.13p (단순 arch에서의 v28 효과 재현) → 약 69.38%
+실제: **+0.45p** (68.25% → 68.70%)
+
+기대의 약 40%. 왜 절반도 안 됐을까?
+
+가설 1 — v8 arch가 전처리 노이즈를 자체적으로 흡수한다.
+  단순 arch에서 전처리 순서 차이가 크게 느껴졌던 이유는,
+  모델 자체의 표현력이 낮아 입력 신호의 품질에 민감했기 때문.
+  v8 arch(MaxPool×2, 비선형 Attention, subject emb→LSTM)는 더 풍부한 특징 추출이 가능해
+  다소 덜 최적화된 전처리도 보완할 수 있다.
+  → 전처리 품질 개선의 한계 효용이 강한 아키텍처에서는 감소.
+
+가설 2 — non-zero mean의 부작용.
+  v32의 X_train mean=0.2440: env 채널이 항상 양수여서 입력 분포가 비대칭.
+  v30은 24ch 공동 정규화로 mean≈0 유지.
+  BatchNorm이 이를 부분적으로 보정하지만, LSTM 입력 분포의 비대칭이
+  학습 효율에 미세한 영향을 줄 수 있다.
+
+그럼에도 Hard acc 개선은 기대 이상:
+  Hard acc: v30 57.04% → v32 57.84% (+0.80p)
+  Easy acc: v30 69.85% → v32 70.25% (+0.40p)
+  전처리 개선이 hard subjects에서 불균형적으로 효과를 발휘.
+
+  이유 추정: hard subjects의 EMG 신호는 노이즈가 많아 raw EMG에서 바로 계산한 envelope이
+             더 오염됨. normalized EMG에서 envelope 계산 시 노이즈 영향 감소 → hard 개선.
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음.
+
+주목할 관찰:
+  Early stop at epoch 40 (v30은 50ep 완주).
+  val_f1이 ep32(0.6130) 이후 ep39까지 미개선 → patience=8 소진.
+  tr_acc=0.878 (v30의 0.895보다 낮음) → v28 데이터가 더 어렵거나
+  비대칭 입력 분포로 학습이 약간 느릴 수 있음.
+
+  소요 시간: 88.2분 (v30의 110.9분보다 20% 빠름 — early stop 덕분).
+
+
+[6] 이번 버전에서 배운 점
+
+**아키텍처가 강할수록 전처리 품질 개선의 한계 효용이 감소한다.**
+
+  단순 arch에서 전처리 개선(v28): +1.13p
+  v8 arch에서 동일 전처리 개선(v32): +0.45p
+
+  이것은 모델 복잡도와 전처리 품질 사이의 교환 관계(trade-off)를 보여준다.
+  v8 arch는 내부적으로 피험자 개인화(subject embedding)와 시간적 추상화(MaxPool+LSTM)로
+  전처리의 일부 결함을 흡수한다.
+
+**그럼에도 v32는 v8 pooled(68.68%)를 처음으로 넘어섰다.**
+  v32(68.70%) > v8 pooled(68.68%) > v30(68.25%)
+  팀 데이터 + normalize→env 전처리가 v8 원본 데이터와 동등 이상의 성능에 도달.
+
+**Hard subjects 개선이 전처리 순서에 민감하다.**
+  v30→v32에서 easy acc +0.40p, hard acc +0.80p로 hard가 2배 더 개선.
+  신호 품질이 낮은 피험자일수록 envelope 계산 전 정규화 여부가 중요.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+1. **(v33, 즉시) v32 체크포인트 기반 per-subject fine-tuning**
+   v32(68.70%)에 v31 방식 fine-tuning 적용.
+   v31에서 +0.13p였지만, v32는 v30보다 hard acc가 높아
+   fine-tuning 과적합 위험이 일부 완화될 수 있음.
+   기대: 68.70% + 0.13~0.25p = **68.85~69%** 수준.
+   → 조심스럽게 69% 돌파 가능성.
+
+2. **(v33 대안) v32 데이터 기반 hard subject oversampling**
+   Hard acc 57.84% — 여전히 12.40p gap 존재.
+   hard subjects {4,7,26,28,31} 2~3× 오버샘플링 후 v32 재학습.
+   기대: hard acc 57.84% → 60%+, overall 0.3~0.5p 개선.
+
+3. **(중기) 전처리 추가 개선 — 24ch 공동 정규화**
+   v32의 non-zero mean 문제 해결:
+   v28 방식 전처리 후 24ch 전체를 다시 per-subject jointly normalize.
+   (normalize→env→stack24ch→normalize24ch→window)
+   기대: mean≈0 확보로 학습 안정성 개선 + 추가 소폭 성능 향상.
+   단, 정규화 2회 적용의 효과는 실험으로 확인 필요.
+
+4. **(중기) 더 긴 학습 + LR warm-up**
+   v32 early stop ep40, tr_acc=0.878 → 아직 수렴 여지 있음.
+   LR warm-up(5ep) + 100ep + patience=15로 더 느린 학습.
+   기대: 0.2~0.3p 추가 가능.
+
+
+[8] 재현 정보
+
+  python code/train_cnn_v32.py
+
+  DATA_DIR = /mnt/data/medical_project/ninapro_db2_project/전처리전달_v28
+  OUT_DIR  = /mnt/data/medical_project/ninapro_db2_project/results/v32
+
+  결과: results/v32/result_v32.json
+  주의: 전처리전달_v28/ 존재 필요 (build_dataset_v28.py로 생성).
+        v28 데이터는 이미 정규화 완료 — 추가 normalize 없음.
+
+
+[9] 비용 원장
+
+  학습 시간 : 88.2분 (early stop ep40 덕분에 v30의 110.9분보다 20% 단축)
+  데이터     : 전처리전달_v28/ (이미 존재, 재전처리 없음)
+  결과물     : results/v32/ (~수 MB)
+  GPU 메모리 : 측정하지 않음 (batch=256, v30과 동일 설정 → 문제 없었음)
+
+  비용 관련 특이사항:
+    early stop이 ep40에서 발생해 v30보다 빨리 끝남.
+    val_f1 정체(ep32 이후)는 v28 데이터의 non-zero mean 분포로 인한 학습 정체일 수 있음.
+
+
+[전체 버전 비교표 (누적)]
+
+  버전  데이터                아키텍처    방식         acc       hard acc
+  ────  ────────────────────  ──────────  ──────────  ──────    ──────
+  v25   팀 5Hz                단순        pooled      62.58%      —
+  v27   팀 10Hz               단순        pooled      63.56%    51.80%
+  v28   팀 10Hz (norm→env)    단순        pooled      64.69%      —
+  v29   v8 전처리             단순        pooled      63.57%    51.97%
+  v8    v8 전처리             v8 arch     pooled      68.68%      ~58%
+  v30   팀 10Hz               v8 arch     pooled      68.25%    57.04%
+  v31   팀 10Hz               v8 arch     fine-tuned  68.38%    56.73%
+  v32   v28 전처리            v8 arch     pooled      68.70%    57.84%  ← 현재
+  v10   v8 전처리             v8 arch     fine-tuned  69.10%      ~58%
+
+  v32(68.70%) ≈ v8 pooled(68.68%): 팀 데이터가 v8 원본 수준에 도달.
+  v10(69.10%)까지 남은 거리: -0.40p
+  다음 목표: v33 fine-tuning 또는 oversampling으로 69% 돌파.

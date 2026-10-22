@@ -1,0 +1,192 @@
+================================================================
+v31 — v30 체크포인트 기반 per-subject fine-tuning: 68.38%
+       fine-tuning 효과 미미 (+0.13p) — 팀 전처리의 역설
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v30이 68.25%로 v8 pooled(68.68%)에 사실상 도달했다.
+다음 자연스러운 질문: "v30도 fine-tuning하면 v10(69.10%)에 도달할 수 있을까?"
+
+v10이 v8(68.68%) → 69.10%로 +0.42p를 달성했던 방식은 per-subject fine-tuning이었다:
+  - CNN backbone 동결(freeze_cnn)
+  - subject_emb + LSTM + Attention + fc만 피험자별 업데이트
+  - 피험자별로 독립적으로 v8 체크포인트를 로드한 뒤 fine-tuning
+
+v31은 이 방식을 v30에 그대로 적용한다.
+  BASE_CKPT = results/v30/best_model_v30.pth
+  DATA_DIR  = 전처리전달_10hz/  (팀 10Hz/4차 전처리)
+
+선택지로 고려한 것들:
+  (A) v32: v28 전처리(norm→env 순서) + v8 arch → 전처리 개선 방향
+  (B) v31: v30 fine-tuning → 기존 검증된 방식 재현
+  (C) Hard subject oversampling → 특정 피험자 개선 집중
+
+v10의 선례가 확실하므로 (B)를 먼저 실행. 팀 데이터에서도 동일한 패턴이 재현되는지 확인.
+
+
+[2] 전 버전(v30)과 달라진 점
+
+v30: 40명 데이터 전체를 한 번에 학습 (pooled training)
+     결과: 68.25% mean per-subject test accuracy
+
+v31: 40명 각각 독립적으로 fine-tuning
+     - 매 피험자마다 v30 체크포인트 재로드
+     - freeze_cnn 적용: CNN("cnn") 동결, 나머지 학습
+     - Adam(lr=1e-4), 최대 15ep, patience=5
+     - batch=128 (pooled 256의 절반 — 피험자당 데이터 적어서)
+     - val로 최적 epoch 선택 → test 평가
+
+학습 파라미터 수 (trainable):
+  전체 805,266 → CNN 동결 시 약 367,634개 (45.7%)
+
+
+[3] 변경 이유 + 기대했던 효과
+
+freeze_cnn 방식의 이론적 근거:
+  CNN은 EMG의 저수준 특징(주파수 성분, 시간 패턴)을 추출한다.
+  이 특징들은 피험자 간 공통된 생리적 패턴이므로 재학습할 필요가 없다.
+  반면 LSTM + Attention + subject_emb는 피험자 개인의 신호 스타일을 인코딩한다.
+  → CNN은 frozen general feature extractor, 나머지는 per-subject adapter.
+
+v10에서 이 방식이 +0.42p를 달성했으므로:
+  v31 기대: 68.25% + 0.3~0.5p = **68.5~68.8%**
+  특히 hard subjects (s04, s07, s26, s28, s31)의 개선 기대.
+  pooled 모델은 hard subject 데이터를 easy subject와 함께 학습하므로
+  hard 특성에 덜 최적화됨 → 피험자별 fine-tuning으로 보완 가능하리라 예상.
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: +0.3~0.5p (v10의 +0.42p 재현)
+실제: **+0.13p** (68.25% → 68.38%)
+
+v10 대비 fine-tuning 효과가 약 1/3 수준.
+
+피험자별 분석:
+
+  개선된 피험자 (22/40):  최대 +1.27p (s36), +1.13p (s13), +0.99p (s16)
+  악화된 피험자 (18/40):  최대 -0.94p (s26), -0.71p (s06), -0.62p (s40)
+
+Hard subjects 개별 delta:
+  s04:  -0.07p  ← 소폭 악화
+  s07:  -0.45p  ← 악화
+  s26:  -0.94p  ← 가장 큰 악화
+  s28:  +0.44p  ← 유일하게 개선
+  s31:  -0.56p  ← 악화
+  Hard 평균: 56.73% (v30 base 57.04% 대비 -0.31p)
+
+특이 패턴:
+  - Easy subjects는 평균 +0.19p 개선 (70.04% → vs v30 easy 69.85%)
+  - Hard subjects는 오히려 -0.31p 악화
+  - Fine-tuning이 easy한 피험자는 돕고 hard한 피험자는 해치는 양상
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음.
+  - 체크포인트 로드, 학습, 평가 모두 정상 동작.
+  - v30 base mean acc = 68.25% 정확히 재현 (per-subject 평균 일치).
+  - 소요 시간: 22.6분 (pooled v30 110.9분의 1/5 — 피험자당 약 34초).
+
+주목할 관찰:
+  Hard subjects 중 s26(-0.94p), s31(-0.56p), s07(-0.45p)가 fine-tuning 후 악화.
+  이 피험자들은 train 데이터 자체가 노이즈가 많아(hard의 정의) fine-tuning이
+  오히려 노이즈에 과적합(overfitting)하는 것으로 보인다.
+  Patience=5로 15ep 내 조기 종료했지만 방어가 충분하지 않았다.
+
+
+[6] 이번 버전에서 배운 점
+
+**핵심 발견: 팀 전처리(post-windowing per-subject normalization)는 fine-tuning 효과를 희석한다.**
+
+v8 데이터와 팀(10Hz) 데이터의 근본적 차이:
+  - v8: normalize_per_subject를 연속 신호 전체(윈도우 전)에 적용
+         → 각 피험자의 신호 스타일이 정규화 후에도 피험자 간 상대적 차이 보존
+  - 팀: windowed 후 per-subject normalization
+         → 이미 피험자별로 분리된 통계로 정규화 → 피험자 간 특성 차이 상당 부분 제거
+
+즉, 팀 전처리가 이미 per-subject adaptation의 역할을 일부 수행하고 있다.
+결과적으로 모델의 subject_emb가 해야 할 일이 줄어들고,
+fine-tuning으로 그 부분을 더 최적화해도 얻을 것이 적다.
+
+**일반화된 원칙:**
+"전처리 단계에서 이미 피험자 개인화가 강하게 이루어진 경우,
+ fine-tuning의 추가 이득은 전처리가 덜 개인화된 경우보다 작다."
+
+부가 발견:
+  Hard subjects에서 fine-tuning이 역효과를 낸다.
+  신호 품질이 낮은 피험자에게는 적은 데이터로의 fine-tuning이
+  과적합 위험을 키운다. Hard subjects는 오히려 pooled 모델이 더 안정적.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+1. **(v32, 즉시) v28 전처리 + v8 arch 조합**
+   이유: v28이 단순 arch에서 +1.13p를 달성 (v27 대비).
+         v8 arch에서도 유사한 개선 기대 → 68.25% + ~1p = 69~69.5% 예상.
+   전처리: filter → normalize(12ch) → |norm_emg| → lowpass_env → stack 24ch → window
+   데이터: 전처리전달_v28/
+
+2. **(v33, 단기) Hard subject oversampling + focal loss**
+   이유: v30에서 hard acc=57.04%, fine-tuning(v31)으로도 오히려 56.73%로 악화.
+         hard subjects {4,7,26,28,31}를 2~3× 오버샘플링 후 pooled 학습.
+         focal loss(γ=2)로 어려운 샘플에 집중.
+   기대: hard acc 57% → 60%+ (easy acc는 소폭 감소 감수)
+
+3. **(중기) v31-style fine-tuning 개선 — hard subject 방어**
+   현재 문제: hard subjects에서 fine-tuning이 과적합.
+   개선 방향:
+     - Hard subjects에 더 강한 정규화 (smaller LR, stronger weight decay)
+     - Hard subjects의 patience를 줄이거나 FT_EPOCHS 단축
+     - Hard/easy를 구분하여 다른 하이퍼파라미터 적용
+   기대: hard acc 56.73% → 58%+ (easy는 현행 유지)
+
+4. **(중기) v28 데이터 기반 fine-tuning (v34)**
+   v28 전처리는 12ch EMG 먼저 정규화 → 피험자 개인 특성이 팀 10Hz보다
+   더 많이 남아있을 수 있음 → fine-tuning 효과 더 클 수 있음.
+   v32(v28+v8arch) 결과 나온 뒤 fine-tuning 적용 여부 판단.
+
+
+[8] 재현 정보
+
+  python code/finetune_v31.py
+
+  DATA_DIR  = /mnt/data/medical_project/ninapro_db2_project/전처리전달_10hz
+  BASE_CKPT = /mnt/data/medical_project/ninapro_db2_project/results/v30/best_model_v30.pth
+  OUT_DIR   = /mnt/data/medical_project/ninapro_db2_project/results/v31
+
+  결과: results/v31/result_v31.json
+  주의: v30 체크포인트(best_model_v30.pth) 존재 필요.
+
+
+[9] 비용 원장
+
+  학습 시간 : 22.6분  (피험자당 평균 ~34초 × 40명)
+              pooled v30(110.9분)의 약 1/5 — 피험자당 데이터가 적어 빠름
+  데이터     : 전처리전달_10hz/ (이미 존재, 추가 전처리 없음)
+  결과물     : results/v31/result_v31.json (~40KB)
+  GPU 메모리 : 측정하지 않음 (batch=128로 v30보다 작아 여유 있었을 것으로 추정)
+
+  비용 관련 특이사항: 없음.
+  Fine-tuning은 pooled 학습 대비 1/5 시간으로 마무리.
+  성능 향상(+0.13p)이 시간 대비 가성비는 높지 않음.
+
+
+[전체 버전 비교표 (누적)]
+
+  버전  데이터                아키텍처    방식         acc
+  ────  ────────────────────  ──────────  ──────────  ──────
+  v25   팀 5Hz                단순        pooled      62.58%
+  v27   팀 10Hz               단순        pooled      63.56%
+  v28   팀 10Hz (norm→env)    단순        pooled      64.69%
+  v29   v8 전처리             단순        pooled      63.57%
+  v8    v8 전처리             v8 arch     pooled      68.68%
+  v30   팀 10Hz               v8 arch     pooled      68.25%
+  v10   v8 전처리             v8 arch     fine-tuned  69.10%
+  v31   팀 10Hz               v8 arch     fine-tuned  68.38%  ← 현재
+
+  팀 10Hz + fine-tuning의 한계: 68.38%
+  v10 대비: -0.72p
+  v30 대비 fine-tuning 이득: +0.13p (v10의 +0.42p보다 약 1/3 수준)

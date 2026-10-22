@@ -1,0 +1,111 @@
+================================================================
+v28 — 정규화→엔벨로프 순서 (v8 방식 1차 시도): 64.69%
+       여전히 v10 대비 4.41p 갭 미설명
+================================================================
+
+[이 버전을 시작한 계기]
+
+v27(63.56%) 분석 결과, 엔벨로프 필터(+0.98p) 외에도 정규화 순서가 다름을 확인:
+  팀 코드(v27): |EMG| → 엔벨로프 → 윈도우 → 정규화  (env→norm)
+  우리 v8     : 정규화 → |정규화된EMG| → 엔벨로프    (norm→env)
+
+가설: 엔벨로프가 "정규화된 신호"의 절댓값이어야 피처 품질 향상.
+→ v28: build_dataset_v28.py - 연속 EMG 12ch 정규화 후 엔벨로프 계산.
+
+
+[방법: code/build_dataset_v28.py + code/train_cnn_v28.py]
+
+파이프라인:
+  filter(12ch) → 연속신호 12ch 정규화(train rep) → |정규화된EMG| → lowpass env → stack 24ch → window
+
+아키텍처: v10/v25/v26/v27과 100% 동일
+데이터: 전처리전달_v28/ (build_dataset_v28.py 출력)
+하이퍼파라미터: v10 동일 (AdamW 1e-3, CosineAnnealingLR, 50ep, patience=8, batch=256)
+
+데이터 분포:
+  X_train mean=0.2440  std=0.8545  min=-476.96  max=198.56
+  (mean=0.24 > 0: 정규화된 EMG의 절댓값인 env 채널이 양수만 가짐 → 전체 평균 양수)
+
+
+[재현 정보]
+
+  python code/build_dataset_v28.py   # 전처리
+  python code/train_cnn_v28.py       # 학습
+  # 모델: results/v28/best_model_v28.pth
+  # 결과: results/v28/result_v28.json
+
+
+[비용 원장: 시간/디스크/GPU]
+
+  학습 시간: 363.8분 (6.1시간). 50ep 완주 (early stop 미발동).
+  결과물: results/v28/
+
+
+[결과]
+
+  학습 곡선: 단조 증가, 안정적. val_f1 best: ep46 0.5344.
+
+  테스트 결과:
+
+                    v10       v27       v28
+  전체 acc          69.10%    63.56%    64.69%
+  Hard acc          ~58%      51.80%    53.09%
+  Easy acc          ~71%      65.24%    66.34%
+  Gap (easy-hard)   ~13p      13.43p    13.25p
+  Macro-F1          —         48.01%    50.01%
+
+  v27 대비: +1.13p
+  v10 대비: -4.41p (여전히 큰 갭)
+
+
+[기대와 실제가 어떻게 달랐는가]
+
+기대: 정규화→엔벨로프 순서가 v8과 같아졌으므로 큰 폭 개선 기대.
+
+실제: +1.13p. 방향은 맞지만 여전히 4.41p 갭.
+
+결론: **v28의 "정규화→env" 구현이 v8과 다른 방식이었다.**
+
+사후 분석 (data_utils.py 확인):
+  v8 실제 순서 (data_utils.py line 195-197):
+    filter → |EMG|(raw) → lowpass → env(12ch) → stack 24ch → normalize(24ch 전체) → window
+
+  v28에서 구현한 순서:
+    filter → normalize(12ch EMG 연속) → |norm_EMG| → lowpass → env → stack 24ch
+
+  → 두 가지 차이:
+    1. 정규화 대상: v8은 EMG+envelope 24ch 전체를 jointly 정규화
+                    v28은 EMG 12ch만 정규화, env는 항상 양수로 남음
+    2. rep=0 처리: v8은 정규화 통계에 rep=0 구간 포함
+                   v28은 train rep {1,2,3,4}만 사용 (rep=0 제외)
+    3. 윈도우: v8은 rep=0 윈도우 포함 (segment_signal에 rep=0 제외 로직 없음)
+               v27/v28은 rep=0 윈도우 명시적 제외
+
+
+[갭 분석 누적]
+
+  v25(5Hz/2차, team)                          : 62.58%  기준
+  + 필터 10Hz/4차                [v27]         : +0.98p
+  + 정규화→env 순서(12ch만)    [v28]         : +1.13p
+  ─────────────────────────────────────────────────────
+  현재까지 설명된 갭: 2.11p / 총 갭 6.52p
+  미설명: 4.41p → v8의 24ch 공동 정규화 + rep=0 처리 차이로 가설
+
+
+[전략적 결정]
+
+v29: v8 파이프라인을 정확히 복제 (data_utils.py의 실제 순서 그대로)
+  filter → env(raw) → stack 24ch → normalize(24ch, 연속, rep=0 포함) → window(rep=0 포함)
+
+
+[향후 개선 후보]
+
+1. (즉시, v29) v8 파이프라인 정확 복제.
+   - |raw EMG| → lowpass → stack 24ch → normalize 24ch 연속신호(rep=0 포함)
+   - 윈도우에서 rep=0 포함
+   기대: v10 수준(69%) 회복 → 팀 파이프라인 전환 확정 근거.
+
+2. v29 성공 시: 팀에 파이프라인 전환 권고 (정규화 대상 = 24ch 전체).
+
+3. v29도 갭 있으면: 추가 파이프라인 차이 탐색
+   (연속 신호 처리 방식, label offset 처리, 기타 미확인 차이).

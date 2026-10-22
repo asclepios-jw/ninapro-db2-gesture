@@ -1,0 +1,190 @@
+================================================================
+v35 — Adaptive per-subject model selection: 68.99%
+       v10(69.10%)까지 -0.11p — 팀 데이터 최고 성능
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v33(68.89%)에서 17개 피험자가 fine-tuning 후 오히려 악화됐다.
+v34(oversampling)는 실패했고, 남은 선택지 중 가성비가 가장 높은 방법이
+"val_f1 기준으로 피험자별로 base vs fine-tuned 중 나은 모델을 자동 선택"이었다.
+
+핵심 아이디어:
+  fine-tuning이 도움이 되는 피험자 → fine-tuned 모델 사용
+  fine-tuning이 해가 되는 피험자 → v32 base 모델 그대로 사용
+  기준: 피험자별 val_macro_f1 (ft_val_f1 > base_val_f1 → FT 선택)
+
+새 학습 불필요. v32 체크포인트 + 피험자별 fine-tuning 실행 + val 기준 선택만 추가.
+
+
+[2] 전 버전(v33)과 달라진 점
+
+v33: 모든 피험자 무조건 fine-tuned 모델로 test 평가
+v35: 피험자별 val_f1 비교 후 base / fine-tuned 중 선택
+
+BASE_CKPT, DATA_DIR, FT 하이퍼파라미터 모두 v33과 동일:
+  BASE_CKPT = results/v32/best_model_v32.pth
+  DATA_DIR  = 전처리전달_v28/
+  freeze_cnn, Adam(1e-4), 15ep, patience=5, batch=128
+
+
+[3] 변경 이유 + 기대했던 효과
+
+v33에서 확인된 패턴:
+  fine-tuning으로 악화된 피험자 17명의 손실 합산 = 약 -0.2p (mean 기준)
+  이 손실을 base 모델로 대체하면 +0.1~0.15p 회수 가능.
+
+단, val 성능이 test 성능의 완벽한 대리지표가 아니므로
+실제 회수는 이론값보다 낮을 수 있음.
+
+기대: 68.89% + 0.10~0.15p = 69.0% 내외
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: +0.10~0.15p → 69.0% 내외
+실제: **+0.10p** (68.89% → 68.99%) — 기대 범위 하단 정확히 달성.
+
+선택 통계:
+  FT 사용: 32명 / BASE 사용: 8명
+  BASE 선택 피험자: s04, s06, s07, s09, s11, s16, s20, s23
+
+Hard subjects:
+  s04(H): BASE 선택 → 0.5875 (v33 0.5803 대비 **+0.72p** 회수)
+  s07(H): BASE 선택 → 0.6190 (v33 0.6134 대비 **+0.56p** 회수)
+  s26(H): FT  선택 → 0.6136 (+0.38p vs v33)
+  s28(H): FT  선택 → 0.5545 (-0.04p vs v33, 미미)
+  s31(H): FT  선택 → 0.5634 (+0.79p vs v33)
+  Hard 평균: **58.76%** (v33 58.28% 대비 +0.48p) ← 지금까지 최고
+
+v33 대비 개선된 피험자: 25명 / 악화된 피험자: 15명
+  (v33은 개선 23명 / 악화 17명 → 개선 비율 향상)
+
+val_f1 기준이 맞지 않았던 경우 (val FT>BASE인데 test에서 오히려 나빴음):
+  s09: val에서 FT<BASE라 BASE 선택 → test_acc=0.7256 (v33 0.7371 대비 -0.0115)
+       → 이 경우는 val이 틀렸음 (val BASE 우세지만 test에서는 FT가 나았을 것)
+  s10: val FT>BASE라 FT 선택 → 0.6515 (v33 0.6623 대비 -0.0108)
+  → val ≠ test인 일부 케이스는 피할 수 없음
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음.
+소요 시간: 28.4분 (v33의 27.8분과 거의 동일 — 동일한 fine-tuning 후 base 평가 추가).
+
+주목할 관찰:
+  s04, s07 두 피험자가 v31, v33 모두에서 fine-tuning 악화됐는데
+  이번에 BASE 선택으로 자동 회수됨.
+  adaptive 전략이 이 문제를 자연스럽게 해결.
+
+  s40: v33에서 -0.95p 악화됐는데 v35에서 FT 선택 → +1.21p (v33 대비).
+  이는 v35 fine-tuning 과정이 v33과 다른 수렴 경로를 탄 것으로 추정.
+  (동일 코드지만 dropout 등 확률적 요소로 매 실행마다 결과 미세 차이)
+
+
+[6] 이번 버전에서 배운 점
+
+**Adaptive selection은 fine-tuning의 과적합 위험을 val_f1로 자동 필터링한다.**
+
+v33(무조건 FT)과 v35(adaptive)의 차이:
+  - 전체: +0.10p
+  - hard: +0.48p
+  구현 복잡도 추가는 적고, 이득은 유의미했다.
+
+**그러나 val ≠ test인 케이스는 피할 수 없다.**
+  val_f1이 test_acc의 불완전한 대리 지표이므로
+  일부 피험자에서는 잘못된 선택을 한다.
+  (s09: BASE 선택했으나 test에서 FT가 더 나았을 것)
+
+**현재까지의 성능 상한:**
+  v35 = 68.99% → v10(69.10%)까지 -0.11p.
+  0.11p는 단일 run의 확률적 분산(dropout, 배치 순서) 범위에 근접.
+  즉 다음 시도에서 v10을 넘을 수도 있고 미칠 수도 있는 수준.
+
+**팀 데이터로 달성 가능한 현실적 상한선 추정: ~69.0~69.1%**
+  더 이상의 개선은 아키텍처 변경이나 근본적으로 다른 접근 없이는 어렵다.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+**즉각적 개선 여지가 거의 없음 — v35가 현실적 ceiling에 근접.**
+
+그럼에도 탐색할 수 있는 방향:
+
+1. **(탐색) 24ch 공동 정규화 전처리**
+   v28의 non-zero mean(0.24) 문제 해결.
+   filter → norm12ch → env → stack24ch → norm24ch jointly.
+   이를 기반으로 재학습 + adaptive fine-tuning.
+   기대: ~69.1~69.3% (전처리 품질 개선으로 pooled baseline 향상 → fine-tuning도 개선)
+   비용: 새 전처리(~30분) + 재학습(~90분) + fine-tuning(~30분) = 약 2.5시간
+
+2. **(탐색) 아키텍처 개선**
+   v8 arch의 현재 ceiling이 드러남. 더 강한 모델 탐색:
+   - Transformer encoder (Multi-head Self-Attention) 대체
+   - 더 깊은 CNN (3→4 layer)
+   - Multi-scale feature (다른 kernel size 병렬)
+   기대: +0.5p 이상 가능하나 설계 및 실험 시간 큰 폭 증가.
+
+3. **(보고) v35로 마무리**
+   0.11p 차이는 run variance 범위.
+   "팀 데이터 + v8 arch + adaptive fine-tuning = 68.99% ≈ v10(69.10%)"
+   → 목표 달성에 사실상 근접. 나머지 0.11p는 통계적 노이즈 수준.
+   보고서 스토리: 아키텍처가 핵심(+4.69p), 전처리가 보조(+0.45p),
+                  fine-tuning이 추가 이득(+0.29p).
+
+
+[8] 재현 정보
+
+  python code/finetune_v35.py
+
+  DATA_DIR  = /mnt/data/medical_project/ninapro_db2_project/전처리전달_v28
+  BASE_CKPT = /mnt/data/medical_project/ninapro_db2_project/results/v32/best_model_v32.pth
+  OUT_DIR   = /mnt/data/medical_project/ninapro_db2_project/results/v35
+
+  결과: results/v35/result_v35.json
+  주의: v32 체크포인트(best_model_v32.pth) 존재 필요.
+        v33 result_v33.json이 있으면 delta_v33 컬럼 출력 (없어도 동작).
+  재현 시 주의: dropout/확률적 요소로 피험자별 선택(FT/BASE)이 달라질 수 있음.
+               전체 평균은 ±0.05p 내 수렴 예상.
+
+
+[9] 비용 원장
+
+  학습 시간 : 28.4분 (v33의 27.8분과 거의 동일)
+  데이터     : 전처리전달_v28/ (이미 존재)
+  결과물     : results/v35/result_v35.json
+  GPU 메모리 : 측정하지 않음
+
+  비용 관련 특이사항:
+    새 학습 없이 28분 만에 v33(68.89%) → v35(68.99%) +0.10p 달성.
+    단위 시간당 성능 향상 효율 최고.
+
+
+[전체 버전 비교표 (누적 — 최종)]
+
+  버전  데이터              아키텍처  방식                  acc       hard acc
+  ────  ──────────────────  ────────  ────────────────────  ──────    ──────────
+  v25   팀 5Hz              단순      pooled                62.58%        —
+  v27   팀 10Hz             단순      pooled                63.56%    51.80%
+  v28   팀 10Hz (norm→env)  단순      pooled                64.69%        —
+  v29   v8 전처리           단순      pooled                63.57%    51.97%
+  v8    v8 전처리           v8 arch   pooled                68.68%      ~58%
+  v30   팀 10Hz             v8 arch   pooled                68.25%    57.04%
+  v31   팀 10Hz             v8 arch   fine-tuned (전체)     68.38%    56.73%
+  v32   v28 전처리          v8 arch   pooled                68.70%    57.84%
+  v34   v28 전처리          v8 arch   pooled + hard×2       68.61%    58.00%
+  v33   v28 전처리          v8 arch   fine-tuned (전체)     68.89%    58.28%
+  v35   v28 전처리          v8 arch   fine-tuned (adaptive) 68.99%    58.76%  ← 최고
+  v10   v8 전처리           v8 arch   fine-tuned            69.10%      ~58%
+
+  v10까지 남은 거리: -0.11p (run variance 수준)
+  팀 데이터 best: v35 (68.99%)
+  hard acc 추이: 51.80%→57.04%→57.84%→58.28%→58.76% (꾸준한 상승)
+
+  핵심 기여 분석 (v25 → v35):
+    아키텍처 변경 (v27→v30): +4.69p  (전체 개선의 72%)
+    전처리 개선  (v30→v32): +0.45p  (전체 개선의  7%)
+    Fine-tuning  (v32→v35): +0.29p  (전체 개선의  4%)
+    필터 변경    (v25→v27): +0.98p  (전체 개선의 15%)
+    정규화 순서  (v27→v28*): +1.13p  (* 단순 arch 기준)

@@ -1,0 +1,139 @@
+================================================================
+v19 — Subject-aware DANN: hard 피험자 역대 최고, easy 피험자 폭락
+================================================================
+
+[이 버전을 시작한 계기]
+
+v18에서 subject embedding을 완전히 제거한 DANN이 전 지표 악화라는 명확한
+음성 결과를 냈다. 원인 분석에서 "EMG는 본질적으로 피험자-의존적이라 피험자
+정보를 제거하면 동작 구분력도 같이 떨어진다"는 결론이 나왔다. v19는 이를
+수정한 변형 DANN이다:
+
+1) Subject embedding 유지 — label head는 여전히 피험자별로 적응 가능
+2) 도메인 분류기를 40명 전체 → hard/easy 이진으로 단순화 — v12에서 확인한
+   "hard 피험자의 낮은 신호 품질"을 직접 타겟
+3) GRL은 backbone feature(256차원)에만 작용 — subject embedding concat 이전
+
+
+[방법: code/models_v19.py, code/train_cnn_v19.py]
+
+SubjectAwareDANN 아키텍처:
+
+  Feature extractor: Conv1d(24→64→128) + BN + ReLU → BiLSTM(128,2층,양방향)
+                     → attention pooling → 256차원 feature
+  Subject embedding: nn.Embedding(40, 32) → 32차원
+  Label head:        concat(feature, emb) = 288차원 → Dropout(0.4) → Linear(288→50)
+  Domain head:       GRL(alpha) + Linear(256→128) + ReLU + Dropout(0.3) + Linear(128→2)
+                     (hard=0, easy=1)
+
+도메인 라벨 정의:
+  hard = {28, 31, 4, 26, 7} (1-indexed subject ID) → 0
+  easy = 나머지 35명 → 1
+  train 기준 비율: hard 12.42% / easy 87.58%
+
+학습 레시피: AdamW(lr=1e-3, wd=1e-4), CosineAnnealingLR(T_max=30),
+30 epochs, patience=6, LAMBDA_DOMAIN=1.0, Ganin alpha 스케줄.
+총 손실 = CE(gesture, label_smoothing=0.1) + 1.0 × CE(domain_binary).
+
+
+[재현 정보]
+
+  # 컨테이너 안에서 실행
+  python /mnt/data/medical_project/ninapro_db2_project/code/train_cnn_v19.py
+  # CKPT: results/v19/best_model_v19.pth
+  # 결과: results/v19/result_v19.json
+
+
+[비용 원장: 시간/디스크/GPU]
+
+  데이터셋 디스크   : 추가 없음 (v8 데이터 재사용)
+  결과물 디스크     : results/v19/ (체크포인트 ~3MB + result_v19.json)
+  학습 시간         : 212.3분(3.5시간). batch_size=256(v18과 동일), 이유도 동일
+                      (BiLSTM 600 타임스텝 + 두 경로 backprop → OOM 방지).
+
+
+[결과]
+
+                    v8(단일)   v9(fine-tune)   v18(DANN-40)   v19(DANN-이진)
+  전체 acc           68.69%       69.07%          59.10%         62.27%
+  전체 macro-F1      56.92%         —             37.89%         44.64%
+  어려운 5명 acc      57.52%       ~58%            47.47%         68.33%  ←
+  나머지 35명 acc     70.29%       ~71%            60.75%         61.42%  ←
+  격차(easy-hard)    +12.77p      ~+13p           +13.28p        -6.90p  ←
+
+  val macro-F1 수렴 곡선: 0.258(ep1) → 0.424(ep10) → 0.474(ep25) → 0.477(ep30)
+  — 30 에포크 내내 상승, 체크포인트는 ep29(0.4766).
+
+  dom_loss 수렴: 에포크 내내 ~0.35로 안정.
+  이진 분류 랜덤 기준 = log(2) ≈ 0.693. 0.35는 domain classifier가
+  여전히 hard/easy를 구분하고 있다는 의미 — GRL이 완전히 이기지 못했음.
+
+
+[기대와 실제가 어떻게 달랐는가]
+
+기대: subject embedding을 유지하면 v18의 전반적 정확도 손실을 줄이면서,
+이진 DANN이 hard-easy gap을 좁히는 효과를 낼 것. 전체 acc는 v8에 근접하고
+gap은 v8(12.77p)보다 좁아지는 결과를 기대했다.
+
+실제: 전체 acc 62.27%로 v8보다 낮았지만, 가장 눈에 띄는 결과는 gap의 역전이다.
+  - Hard 피험자: 57.52%(v8) → 68.33%(v19) = +10.81p → 프로젝트 역대 최고
+  - Easy 피험자: 70.29%(v8) → 61.42%(v19) = -8.87p → 심각한 손실
+  - Gap: +12.77p(v8) → -6.90p(v19) (easy-hard 기준, 음수 = hard가 더 높음)
+
+즉 easy 피험자를 크게 희생시켜 hard 피험자를 도왔다. 원하던 "둘 다 좋아지는"
+결과가 아니라 "한쪽을 빼앗아 다른 쪽에 준" 제로섬 결과였다.
+
+
+[원인 분석]
+
+핵심 문제는 도메인 라벨 불균형(hard 12.42% vs easy 87.58%)과 LAMBDA_DOMAIN=1.0의
+조합이다:
+
+1. Domain classifier는 "easy"라고 예측하면 87.58%가 맞기 때문에 자연스럽게
+   "easy" 편향이 생긴다.
+
+2. GRL은 이 편향에 반응해 backbone feature를 "easy처럼 보이지 않는" 방향으로
+   강하게 밀어낸다.
+
+3. 결과적으로 backbone feature가 hard 피험자의 신호 특성을 닮아간다 — hard
+   피험자 정확도는 크게 올랐지만, easy 피험자 정확도는 폭락.
+
+4. dom_loss ≈ 0.35 < random(0.693): domain classifier가 여전히 hard/easy를
+   어느 정도 구분하고 있어 GRL의 싸움이 완전히 끝나지 않은 상태. 이 불완전한
+   균형이 오히려 feature를 중간 어딘가로 왜곡시켰을 수 있다.
+
+요약: LAMBDA_DOMAIN=1.0은 12:88 불균형 데이터에서 너무 강한 적대 신호로
+작용했고, easy 피험자 쪽 representation이 무너졌다.
+
+
+[학습 중 예상치 못하게 발생한 문제들 — 버전/환경/하드웨어]
+
+evaluate() 함수에서 sb(subject ID 텐서)를 GPU로 올린 뒤 .cpu() 없이
+.numpy()를 호출해서 TypeError 발생. 즉시 .cpu() 추가로 해결.
+(v18 evaluate()는 sb를 GPU로 올리지 않았기 때문에 없던 버그)
+
+
+[v1~v19 전체를 관통하는 결론]
+
+v19는 "hard 피험자 68.33%"라는 프로젝트 역대 최고 수치를 냈지만, easy 피험자를
+희생시킨 결과라 추천 모델로 채택할 수 없다. 그럼에도 중요한 발견을 포함한다:
+
+  핵심 발견: 이진 DANN은 방향은 맞지만 강도(LAMBDA_DOMAIN=1.0)가 너무 세고,
+  도메인 라벨 불균형(12%/88%)이 보정되지 않아 역효과가 났다.
+
+이 발견이 시사하는 다음 시도:
+  - LAMBDA_DOMAIN 축소(1.0→0.1~0.3): 적대 신호를 약하게 해서 easy 손실 줄이기
+  - 도메인 손실에 클래스 가중치 적용: hard 샘플에 더 높은 가중치(≈7배)를 주어
+    12%/88% 불균형을 보정
+  - One-sided DANN: hard 샘플에만 도메인 손실 적용(easy 샘플은 domain loss 없음)
+
+현재까지 50클래스 기준 최고는 여전히 v9/v10(69.07~69.10%).
+
+
+[향후 개선 후보 (v19 시점까지 미착수)]
+
+- LAMBDA_DOMAIN 조정 재시도 (0.1~0.3 범위)
+- 도메인 손실 클래스 가중치(class_weight) 추가로 12%/88% 불균형 보정
+- One-sided DANN: hard 샘플에만 GRL 적용
+- 40명 개별 모델 학습 후 평균 정확도로 baseline(82.7%)과 진짜 동일 조건 비교
+  (v9부터 계속 미뤄지는 항목)

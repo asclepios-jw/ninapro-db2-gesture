@@ -1,0 +1,170 @@
+================================================================
+v39 — v38(장기학습) base + adaptive fine-tuning: 69.65%
+       장기학습과 fine-tuning은 '대체재'였다 — v37을 못 넘음
+================================================================
+
+
+[1] 이 모델/설정을 선택한 계기 — 결정의 맥락
+
+v38(69.48%)이 장기 학습으로 pooled 최고를 갱신했다. v37이 v36 base에
+adaptive fine-tuning을 얹어 +0.58p(→69.83%)를 얻었으므로,
+더 높은 base(v38)에 같은 방식을 얹으면 70% 돌파가 가능하리라 기대했다.
+
+가설: base가 높을수록 그 위의 fine-tuning 결과도 높다 → 69.48% + ~0.5p = 70%.
+
+
+[2] 전 버전(v37)과 달라진 점
+
+v37: BASE_CKPT = v36 (증강+focal, 50ep)      → adaptive → 69.83%
+v39: BASE_CKPT = v38 (증강+focal, 100ep 장기) → adaptive → ?
+
+나머지 완전 동일: 전처리전달_v28, freeze_cnn, Adam(1e-4), focal(γ=2),
+                 15ep, patience=5, batch=128, val_f1 기준 adaptive 선택.
+
+
+[3] 변경 이유 + 기대했던 효과
+
+v37에서 확인된 시너지 논리("증강으로 좋아진 backbone 위에서 개인화가 더
+잘 먹힌다")를 그대로 연장했다. v38은 v36보다 0.23p 높은 base이므로
+동일 fine-tuning 이득을 더하면 70.0~70.1%가 나올 것으로 기대.
+
+
+[4] 기대와 실제가 어떻게 달랐는가
+
+기대: 69.48% + ~0.5p → 70.0~70.1%
+실제: **69.65%** (v38 base 69.47% 대비 +0.18p) — v37(69.83%)에 못 미침.
+
+  overall : 69.65%  (v38 base 69.47% 대비 +0.18p)
+  hard acc: 59.50%  (v38 base 59.66% 대비 -0.16p — 미세 하락)
+  easy acc: 71.10%  (v38 base 70.87% 대비 +0.23p)
+  선택 통계: FT 26명 / BASE 14명
+
+**핵심 발견: fine-tuning 이득이 v37의 1/3로 줄었다.**
+  v37: v36 base + adaptive = +0.58p, FT 33명 / BASE 7명
+  v39: v38 base + adaptive = +0.18p, FT 26명 / BASE 14명
+
+  base가 더 좋아졌는데(v38 > v36) fine-tuning 이득은 오히려 크게 줄었고,
+  fine-tuning을 채택한 피험자도 33→26명으로 감소.
+  → 더 높은 base가 더 낮은 최종 결과로 이어졌다 (69.83% → 69.65%).
+
+왜? 장기 학습(v38)이 이미 per-subject 적응 여지를 상당 부분 소진했다:
+  freeze_cnn fine-tuning은 LSTM+Attention+subject_emb를 피험자별로 조정한다.
+  그런데 v38의 100ep 장기 학습이 바로 그 상위 레이어들을 이미 충분히
+  최적화해버려서, per-subject fine-tuning이 추가로 짜낼 게 적었다.
+  14명이 BASE를 택했다는 것 = 그 사람들에겐 fine-tuning이 무의미했다는 뜻.
+
+
+[5] 학습 중 예상치 못하게 발생한 문제들
+
+기술적 문제: 없음. (호스트가 아닌 도커 컨테이너 ninapro-dev 안에서 실행 —
+  torch 2.12.0+cu130, /usr/local/bin/python. 호스트에는 해당 파이썬 없음.)
+
+재현 검증: v38 base per-subject mean 69.47% = v38 pooled test 69.48%와 일치.
+소요 시간: 29.1분 (v37과 동일).
+
+val≠test 미스 사례:
+  s31(H): FT 선택했으나 test에서 base 0.5675 > ft 0.5612 (val 오판).
+  hard subject에서 fine-tuning이 여전히 불안정.
+
+
+[6] 이번 버전에서 배운 점
+
+**장기 학습과 adaptive fine-tuning은 '대체재'다 (같은 여지를 놓고 경쟁).**
+
+  대조:
+    증강 + fine-tuning (v36→v37): 초가법적 시너지 (+0.58p, 역할이 다름)
+    장기학습 + fine-tuning (v38→v39): 대체 관계 (+0.18p, 같은 여지를 소진)
+
+  이유:
+    - 증강은 CNN backbone(공통 특징 추출기)을 개선 → 상위 레이어의
+      개인화 여지는 그대로 남음 → fine-tuning이 온전히 이득.
+    - 장기 학습은 상위 레이어(LSTM/Attn/subj_emb)까지 오래 최적화 →
+      fine-tuning이 건드릴 개인화 여지를 미리 소진 → 이득 감소.
+
+  즉 "어디를 개선하느냐"가 시너지/대체를 가른다.
+  backbone을 개선하는 레버(증강)는 개인화와 상보적,
+  상위 레이어를 개선하는 레버(장기학습)는 개인화와 경쟁적.
+
+**결론: 최적 레시피는 v37이다.**
+  v36(적당한 pooled) + 강한 fine-tuning = 69.83%  ← 챔피언 유지
+  v38(장기 pooled) + fine-tuning = 69.65%          ← 대체로 손해
+
+  장기 학습(v38, 3.8시간)은 pooled 단독 최고였지만, 뒤에 fine-tuning을
+  붙이는 최종 파이프라인에서는 오히려 v36보다 못했다.
+  → 파이프라인 전체를 보고 각 단계를 설계해야 한다.
+
+
+[7] 다음 버전에서 고쳐볼 점 + 기대 효과
+
+v39가 "장기학습 경로는 fine-tuning과 궁합이 나쁘다"를 확인했으므로,
+70% 돌파는 다른 레버로 노려야 한다. v37(69.83%)이 여전히 기준선.
+
+1. **(v40, 우선) 증강 강도 튜닝 + v37 레시피**
+   증강이 backbone 개선(개인화와 상보적)이므로 증강을 강화하면
+   fine-tuning 이득을 해치지 않고 base를 올릴 수 있다.
+   변경: magwarp σ 0.20→0.30, timewarp σ 0.15→0.25, mixup α 0.20→0.30.
+   50ep(v36 설정) 유지 → adaptive fine-tuning.
+   기대: base +0.1~0.3p → 최종 70.0~70.1% 가능.
+   근거: 증강+fine-tuning은 시너지이므로 증강 이득이 최종까지 보존.
+
+2. **(v41, 단기) 전극 shift 증강 추가**
+   DB2 전완 둘레 전극에 한해 순환 shift → 착용 편차 직접 모사.
+   hard subject의 피험자 간 변동성 공략. backbone 일반화 강화.
+   기대: hard +0.5p, 최종 +0.1~0.2p.
+
+3. **(중기, 2안) 아키텍처 업그레이드 + 증강**
+   과거 multi-scale(v23/24) 실패는 증강 없이 시도했기 때문.
+   더 강한 backbone(multi-scale/Transformer/residual) + v37 파이프라인.
+   backbone 개선은 fine-tuning과 상보적이므로 시너지 기대.
+   기대: +0.5~1.5p (분산 큼).
+
+4. **(참고) 장기학습 경로는 fine-tuning 없이 단독 제출용으로만.**
+   v38(69.48%)은 pooled 단일 모델로는 최고. fine-tuning 인프라가 없는
+   배포 환경이라면 v38이 최선. 그 외에는 v37 경로 권장.
+
+
+[8] 재현 정보
+
+  # 도커 컨테이너 안에서 실행
+  docker exec ninapro-dev /usr/local/bin/python \
+    /mnt/data/medical_project/ninapro_db2_project/code/finetune_v39.py
+
+  DATA_DIR  = 전처리전달_v28
+  BASE_CKPT = results/v38/best_model_v38.pth
+  OUT_DIR   = results/v39
+  결과: results/v39/result_v39.json, 로그: results/v39_run.log
+  주의: fine-tuning 확률적 → 전체 평균 ±0.1p 분산.
+
+
+[9] 비용 원장
+
+  학습 시간 : 29.1분 (v37과 동일)
+  데이터     : 전처리전달_v28/ (이미 존재)
+  결과물     : results/v39/result_v39.json + v39_run.log
+  GPU 메모리 : 여유 (실행 전 354/8192 MiB, batch=128)
+
+  비용 관련 특이사항:
+    29분 투자했으나 v37(69.83%)을 못 넘음. v38 장기학습(3.8시간)에 이어
+    붙인 fine-tuning까지 총 4.3시간을 들였지만 최종 성능은 v37(v36 50ep
+    +29분 = 총 2.3시간 경로)보다 낮았다. → 장기학습 경로의 총 비용 대비
+    효율이 나쁨을 재확인.
+
+
+[전체 버전 비교표 (누적, 증강 라인)]
+
+  버전  방식                                  acc       hard    비고
+  ────  ────────────────────────────────────  ──────    ──────  ──────────────
+  v32   v28 전처리, pooled                    68.70%    57.84%
+  v36   + 증강 + focal (50ep)                 69.25%    58.71%  첫 v10 돌파
+  v38   + 장기학습 (100ep)                    69.48%    59.66%  pooled 최고
+  v35   v32 + adaptive                        68.99%    58.76%
+  v37   v36 + adaptive                        69.83%    58.87%  ★ 전체 최고
+  v39   v38 + adaptive                        69.65%    59.50%  장기학습 궁합 나쁨
+
+  ★ 챔피언 유지: v37 (69.83%). 70% 미달.
+
+  파이프라인 궁합 분석:
+    증강 → fine-tuning : 시너지  (+0.58p, backbone 개선 = 개인화와 상보)
+    장기학습 → fine-tuning : 대체 (+0.18p, 상위레이어 소진 = 개인화와 경쟁)
+
+  다음: v40 (증강 강도 튜닝 + v37 레시피) → 70% 재도전.

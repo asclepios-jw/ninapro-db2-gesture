@@ -1,0 +1,139 @@
+================================================================
+v29 — v8 파이프라인 정확 복제 시도: 63.57%
+       갭 원인이 전처리가 아닌 아키텍처임을 확인
+================================================================
+
+[이 버전을 시작한 계기]
+
+v28(64.69%) 이후에도 v10(69.10%) 대비 4.41p 갭이 남아 있었다.
+data_utils.py 코드를 직접 읽어 v8 파이프라인의 실제 순서 확인:
+  filter → |raw EMG| → lowpass env → stack 24ch → normalize(24ch, rep∉{5,6}) → window
+
+v28은 12ch EMG만 먼저 정규화한 뒤 envelope을 계산했으나,
+v29는 data_utils.py의 순서를 정확히 따름:
+  - env를 raw filtered EMG에서 계산
+  - 24ch 전체 jointly 정규화 (rep=0 포함, rep∉{5,6})
+  - rep=0 윈도우 포함 (v8 segment_signal에 제외 로직 없음)
+
+가설: v29 ≈ v8 전처리 → v10(69%) 근접 회복.
+
+
+[방법: code/build_dataset_v29.py + code/train_cnn_v29.py]
+
+파이프라인:
+  filter(12ch) → |raw EMG| → lowpass env(12ch) → stack 24ch
+  → normalize(24ch, 연속신호, rep∉{5,6} = rep0 포함) → window (rep=0 포함)
+
+아키텍처: v25-v28과 동일 (Conv1d k=3 + ReLU + No MaxPool + BiLSTM)
+데이터: 전처리전달_v29/ (build_dataset_v29.py 출력)
+
+데이터 검증 (v8 실제 데이터와 비교):
+  v8  train 447,610개  mean=0.0001  std=1.0842  EMG std=1.0681  Env std=1.1000
+  v29 train 447,500개  mean=0.0008  std=1.0837  EMG std=1.0664  Env std=1.1007
+  → 거의 동일. 전처리 복제 성공 (윈도우 수 차이 -110개는 경미).
+
+
+[재현 정보]
+
+  python code/build_dataset_v29.py   # 전처리
+  python code/train_cnn_v29.py       # 학습
+  # 모델: results/v29/best_model_v29.pth
+  # 결과: results/v29/result_v29.json
+
+
+[비용 원장: 시간/디스크/GPU]
+
+  학습 시간: 338.9분 (5.6시간). 50ep 완주.
+  결과물: results/v29/
+
+
+[결과]
+
+  테스트 결과:
+
+              v10(fine-tuned)  v8(pooled)  v29(우리arch+v8data)
+  전체 acc    69.10%           68.68%      63.57%
+  Hard acc    —                —           51.97%
+  Easy acc    —                —           65.23%
+  Gap         —                —           13.25p
+
+  v29 vs v8 pooled: -5.11p (데이터 거의 동일한데 성능 차이 대)
+
+
+[기대와 실제가 어떻게 달랐는가 — 결정적 발견]
+
+기대: v8 전처리 복제 → v8 pooled(68.68%) 근접.
+
+실제: 63.57%. 데이터는 거의 동일한데도 5.11p 차이.
+
+데이터 통계 비교로 전처리가 동일함을 확인한 상태에서 5.11p 차이가 남는다는 것은
+→ 원인이 전처리가 아니라 아키텍처.
+
+[핵심 발견: 아키텍처 비교]
+
+  train_cnn_v8.py → models_v8.SubjectAwareCNNLSTMAttention
+  train_cnn_v29.py → 인라인 SubjectAwareCNNLSTM
+
+  v8 아키텍처 (models_v8.py):
+    Conv1d(24→64, k=5, padding=2) + BN + ELU + MaxPool1d(2)
+    Conv1d(64→128, k=3, padding=1) + BN + ELU + MaxPool1d(2)
+    → 시퀀스 600 → 300 → 150으로 압축
+    LSTM(128+32→128, 2L, bidir) ← Subject emb이 LSTM 입력에 연결 (매 타임스텝)
+    Attention(tanh+linear, 비선형)
+    Dropout(0.4) + Linear(256→50)
+
+  v25-v29 아키텍처 (인라인):
+    Conv1d(24→64, k=3) + BN + ReLU + (MaxPool 없음)
+    Conv1d(64→128, k=3) + BN + ReLU + (MaxPool 없음)
+    → 시퀀스 600 그대로 LSTM 입력
+    LSTM(128→128, 2L, bidir) ← Subject emb 미포함
+    Attention(linear softmax, 선형)
+    Dropout(0.4) + Linear(256+32→50) ← Subject emb을 최종단에 연결
+
+  차이: k5 vs k3, ELU vs ReLU, MaxPool 유무,
+        Subject emb을 LSTM 입력 vs 출력에 연결, 비선형 vs 선형 Attention.
+
+
+[전체 갭 재분석]
+
+  전처리 갭 (동일 아키텍처 기준):
+    v29(v8 전처리) vs v27(팀 10Hz): 63.57% vs 63.56% → +0.01p (전처리 동일화 시 거의 차이 없음)
+    v28(norm→env) vs v27(env→norm): 64.69% vs 63.56% → +1.13p (정규화 순서의 효과)
+
+  아키텍처 갭:
+    v8(v8 arch + v8 data) vs v29(v25 arch + v8 data): 68.68% vs 63.57% → 5.11p
+
+  결론:
+    총 갭 6.52p (팀5Hz vs v10fine-tuned) 중:
+      - 필터 차이:       +0.98p  (5Hz→10Hz)
+      - 정규화 순서:    +1.13p  (env→norm→env)
+      - 아키텍처 차이:  ~5p     (v8 arch의 핵심 요소들)
+      - 전처리 동일화: 차이 거의 없음 (v29≈v27)
+
+
+[전략적 결정]
+
+팀 데이터로 실제 v8 아키텍처를 학습해야 공정한 비교.
+  v30: 팀 데이터(전처리전달_10hz or 전처리전달_v29) + v8 실제 아키텍처 (models_v8.py)
+       → 팀 데이터 + 최적 아키텍처의 baseline 확보.
+
+전처리 팀 권고:
+  정규화 순서(v28 방식, +1.13p)는 팀에 적용 권고 가능.
+  filter/env는 10Hz/4차로 이미 합의.
+  24ch 공동 정규화는 큰 차이 없음 (v29≈v27).
+
+
+[향후 개선 후보]
+
+1. (즉시, v30) 팀 데이터 + models_v8 아키텍처로 학습.
+   기대: 팀 데이터에서 68% 수준 달성 여부 확인.
+   데이터: 전처리전달_10hz/ (v27, 가장 클린한 팀 코드 기반 10Hz)
+          또는 전처리전달_v28/ (v28, +1.13p norm→env 방식)
+
+2. (v30 이후) 아키텍처 개선 재개.
+   Hard subject oversampling, focal loss, 더 긴 학습.
+
+3. 팀 전처리 최종 권고:
+   - ENV 10Hz/4차: 확정 (+0.98p)
+   - 정규화→env 순서(v28): 권고 (+1.13p)
+   - 24ch 공동 정규화: 선택 (효과 미미)
